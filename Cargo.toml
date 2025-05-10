@@ -16,10 +16,10 @@ hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp", "stre
 hyper-rustls = "0.26.0" # for hyper client https support
 bytes = "1"
 http = "0.2" # for request/response types
-url = "2" # for url parsing and manipulation
+url = "2.5.4" # for url parsing and manipulation
 thiserror = "1.0" # for custom error types
-rustls = { version = "0.22.2" } # for server-side tls
-rustls-pemfile = "2.0.0" # for loading certs/keys
+rustls = "0.20.9" # for server-side tls
+rustls-pemfile = "1.0.0" # for loading certs/keys
 futures-util = "0.3" # for stream utilities, like poll_fn
 actix-files = "0.6.2"
 sha2 = "0.10.8"
