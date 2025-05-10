@@ -39,7 +39,9 @@ RUN groupadd -r shadowstep && \
 RUN mkdir -p /app/assets && \
     chown -R shadowstep:shadowstep /app
 
-# Set the working directory
+COPY ./certs /app/certs
+RUN chown -R shadowstep:shadowstep /app/certs
+
 WORKDIR /app
 
 # Copy the compiled binary from the builder stage
