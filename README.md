@@ -5,14 +5,17 @@ a minimal and fairly quick edge CDN written in Rust.
 ## features
 
 ### implemented
-* HTTP/1.1 reverse proxy
-* in-memory caching with TTL and LRU eviction ([ttl hell](https://calpaterson.com/ttl-hell.html))
-* TLS termination (HTTPS)
+* local asset serving (`./assets/`)
+* etag-based in-memory cache (hashmap, no TTL/LRU)
+* gzip compression via actix-web compress middleware
+* health endpoint with cache statistics
+* optional TLS termination (HTTPS)
 
 ### planned
-* content compression (gzip + maybe Brotli adventure)
-* metrics endpoint (Prometheus)
-* cache purge API (invalidation fun🫣)
+* reverse proxy to upstream origin
+* cache TTL and LRU eviction
+* metrics endpoint (prometheus)
+* cache purge api (invalidation fun🫣)
 
 ## getting started
 
