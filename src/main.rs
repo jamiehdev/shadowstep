@@ -20,6 +20,10 @@ use log::{info, warn};
 use sha2::{Sha256, Digest};
 mod config;
 use config::Config;
+use std::fs::File;
+use std::io::BufReader;
+use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
+use rustls_pemfile::{certs, pkcs8_private_keys};
 
 // cache statistics tracker
 struct CacheStats {
@@ -32,6 +36,33 @@ struct CacheStats {
 struct AppState {
     cache_stats: Mutex<CacheStats>,
     cache: Arc<RwLock<HashMap<String, (Vec<u8>, String)>>>, // (content, etag)
+}
+
+fn load_rustls_config(cert_path: &std::path::Path, key_path: &std::path::Path) -> std::io::Result<RustlsServerConfig> {
+    let cert_file = &mut BufReader::new(File::open(cert_path)?);
+    let key_file = &mut BufReader::new(File::open(key_path)?);
+
+    let cert_chain = certs(cert_file)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid cert"))?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+
+    let mut keys = pkcs8_private_keys(key_file)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid key"))?
+        .into_iter()
+        .map(PrivateKey)
+        .collect::<Vec<_>>();
+
+    if keys.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "No private keys found"));
+    }
+    let config = RustlsServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, keys.remove(0))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok(config)
 }
 
 #[get("/assets/{filename:.*}")]
@@ -154,7 +185,7 @@ async fn main() -> std::io::Result<()> {
     });
     
     // configure and start the http server.
-    HttpServer::new(move || {
+    let mut server = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
             .wrap(Compress::default())
@@ -163,8 +194,16 @@ async fn main() -> std::io::Result<()> {
             .service(serve_asset)
     })
     .keep_alive(Duration::from_secs(75))
-    .workers(num_workers)
-    .bind(&config.listen_addr)?
-    .run()
-    .await
+    .workers(num_workers);
+
+    // bind HTTP
+    server = server.bind(&config.listen_addr)?;
+
+    // bind HTTPS if TLS configured
+    if let (Some(cert_path), Some(key_path)) = (config.tls_cert_path.as_ref(), config.tls_key_path.as_ref()) {
+        let tls_config = load_rustls_config(cert_path, key_path)?;
+        server = server.bind_rustls("0.0.0.0:8443", tls_config)?;
+    }
+
+    server.run().await
 }
