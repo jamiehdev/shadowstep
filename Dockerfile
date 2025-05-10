@@ -42,6 +42,10 @@ RUN mkdir -p /app/assets && \
 COPY ./certs /app/certs
 RUN chown -R shadowstep:shadowstep /app/certs
 
+# Copy static assets for serving
+COPY ./assets /app/assets
+RUN chown -R shadowstep:shadowstep /app/assets
+
 WORKDIR /app
 
 # Copy the compiled binary from the builder stage

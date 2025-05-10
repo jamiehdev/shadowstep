@@ -101,12 +101,19 @@ async fn serve_asset(
         return HttpResponse::Ok()
             .append_header((ETAG, etag.clone()))
             .append_header((CACHE_CONTROL, "public, max-age=86400"))
+            .append_header(("X-Shadowstep-Cache", "HIT"))
+            
+            // add debug print
+            .append_header(("X-Debug", "Cache header was added HIT"))
             .content_type(mime_guess::from_path(&filename).first_or_octet_stream().as_ref())
             .body(content.clone());
     }
     
     // if not in cache, read from the filesystem.
     let path = Path::new("/app/assets").join(&filename);
+    
+    // Debug print
+    println!("Looking for file at: {:?}", path);
     
     match tokio::fs::read(&path).await {
         Ok(content) => {
@@ -129,6 +136,8 @@ async fn serve_asset(
             HttpResponse::Ok()
                 .append_header((ETAG, etag))
                 .append_header((CACHE_CONTROL, "public, max-age=86400"))
+                .append_header(("X-Shadowstep-Cache", "MISS"))
+                .append_header(("X-Debug", "Cache header was added MISS"))
                 .content_type(mime_guess::from_path(&filename).first_or_octet_stream().as_ref())
                 .body(content)
         },
