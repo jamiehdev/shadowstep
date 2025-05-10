@@ -4,3 +4,5 @@ Cargo.lock
 .env
 assets/*
 !assets/.gitkeep
+certs/*
+!certs/.gitkeep
