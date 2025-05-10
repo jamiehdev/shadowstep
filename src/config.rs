@@ -20,11 +20,11 @@ pub struct Config {
     pub cache_size_mb: u64,
 
     /// tls cert path
-    #[clap(long, env = "TLS_CERT_PATH")]
+    #[clap(long, env = "TLS_CERT_PATH", long = "tls-cert")]
     pub tls_cert_path: Option<PathBuf>,
 
     /// tls key path
-    #[clap(long, env = "TLS_KEY_PATH")]
+    #[clap(long, env = "TLS_KEY_PATH", long = "tls-key")]
     pub tls_key_path: Option<PathBuf>,
 }
 
