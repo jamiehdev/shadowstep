@@ -116,6 +116,7 @@ kubectl apply -f k8s/service.yaml
 
 ## project structure
 
+```
 shadowstep/
 ├── assets/          # non-code assets (images, configs)
 │   └── images/      # image assets
@@ -123,6 +124,7 @@ shadowstep/
 ├── k8s/             # Kubernetes configs
 ├── Cargo.toml       # rust package config
 └── README.md        # project documentation
+```
 
 ## configuration
 
