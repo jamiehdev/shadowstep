@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shadowstep
+  labels:
+    app: shadowstep
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shadowstep
+  template:
+    metadata:
+      labels:
+        app: shadowstep
+    spec:
+      # pod-level security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: shadowstep
+        image: your-repo/shadowstep:latest # Replace with your image registry/name
+        # imagePullPolicy: Always # Uncomment if using :latest tag frequently
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: https # Optional: if TLS is enabled
+          containerPort: 8443
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        env:
+        - name: LISTEN_ADDR
+          value: "0.0.0.0:8080" # Listen on all interfaces inside the container
+        # - name: TLS_CERT_PATH # Example for TLS, mount via secrets/configmaps
+        #   value: "/etc/tls/tls.crt"
+        # - name: TLS_KEY_PATH
+        #   value: "/etc/tls/tls.key"
+        # You MUST provide ORIGIN_URL, either here or via ConfigMap/Secret
+        # Example:
+        # - name: ORIGIN_URL
+        #   value: "http://my-backend-service.my-namespace.svc.cluster.local"
+        # - name: CACHE_TTL_SECONDS
+        #   value: "600"
+        # - name: CACHE_SIZE_MB
+        #   value: "250"
+        # Volume mounts for TLS certs if not baked into image (recommended for production)
+        volumeMounts:
+        - name: tmpfs-cache
+          mountPath: "/app/assets"
+        # - name: tls-certs
+        #   mountPath: "/etc/tls"
+        #   readOnly: true
+        readinessProbe:
+          httpGet:
+            path: /health # use the health endpoint for readiness check
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health # use the health endpoint for liveness check
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 20
+      volumes:
+      - name: tmpfs-cache
+        emptyDir:
+          medium: Memory
+      # - name: tls-certs
+      #   secret:
+      #     secretName: shadowstep-tls-secret 

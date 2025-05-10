@@ -1,0 +1,35 @@
+[package]
+name = "shadowstep"
+version = "1.0.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web = { version = "4", features = ["rustls"] }
+tokio = { version = "1", features = ["full"] }
+moka = { version = "0.12", features = ["future"] } # for caching
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+log = "0.4"
+hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp", "stream"] } # to reduce features, or note that they have been.
+hyper-rustls = "0.26.0" # for hyper client https support
+bytes = "1"
+http = "0.2" # for request/response types
+url = "2" # for url parsing and manipulation
+thiserror = "1.0" # for custom error types
+rustls = { version = "0.22.2" } # for server-side tls
+rustls-pemfile = "2.0.0" # for loading certs/keys
+futures-util = "0.3" # for stream utilities, like poll_fn
+actix-files = "0.6.2"
+sha2 = "0.10.8"
+serde_json = "1.0.140"
+mime_guess = "2.0.4"
+hex = "0.4.3"
+num_cpus = "1.16.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: shadowstep
+  labels:
+    app: shadowstep
+spec:
+  type: LoadBalancer # or ClusterIP / NodePort depending on your needs
+  selector:
+    app: shadowstep
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+  # - name: https # optional: if tls is enabled
+  #   port: 443
+  #   targetPort: https 
