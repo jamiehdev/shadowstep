@@ -13,7 +13,7 @@ clap = { version = "4", features = ["derive", "env"] }
 env_logger = "0.11"
 log = "0.4"
 hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp", "stream"] } # to reduce features, or note that they have been.
-hyper-rustls = "0.26.0" # for hyper client https support
+hyper-rustls = { version = "0.24", features = ["http2"] } # for hyper client https support
 bytes = "1"
 http = "0.2" # for request/response types
 url = "2.5.4" # for url parsing and manipulation

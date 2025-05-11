@@ -10,12 +10,12 @@ a minimal and fairly quick edge CDN written in Rust.
 * gzip compression via actix-web compress middleware
 * health endpoint with cache statistics
 * optional TLS termination (HTTPS)
+* reverse proxy to upstream origin
 
 ### planned
-* reverse proxy to upstream origin
 * cache TTL and LRU eviction
 * metrics endpoint (prometheus)
-* cache purge api (invalidation fun🫣)
+* cache purge API (invalidation fun🫣)
 
 ## getting started
 
@@ -190,6 +190,70 @@ for HTTPS tests, the output is similar but shows HTTP/2 protocol being used:
 <
 hello HTTPS
 ```
+
+### proxy test
+
+```bash
+curl -i http://localhost:8080/proxy_test.txt
+```
+
+expected response:
+
+```text
+HTTP/1.1 200 OK
+Upstream proxy test content
+```
+
+    example `shadowstep` server logs for this proxied request:
+    ```log
+    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Incoming proxy request: GET /proxy_test.txt from 127.0.0.1
+    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Forwarding request to: http://localhost:3000//proxy_test.txt
+    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Received response from upstream: 200
+    [2025-05-10T23:24:05Z INFO  actix_web::middleware::logger] GET /proxy_test.txt HTTP/1.1 200 28 3.550893 ms
+    ```
+
+#### end-to-end reverse proxy test with python origin
+
+1.  **create a test file in a new `upstream_test` directory:**
+    ```bash
+    mkdir upstream_test
+    echo "hello from upstream" > upstream_test/example.html
+    ```
+
+2.  **start a python http server in that directory on port 3000:**
+    ```bash
+    python3 -m http.server 3000 --directory upstream_test
+    ```
+
+3.  **in another terminal, run shadowstep, configured to proxy to `http://localhost:3000`:**
+    ```bash
+    export ORIGIN_URL=http://localhost:3000
+    ./target/release/shadowstep --listen-addr 0.0.0.0:8081 
+    # (or however you prefer to run it, ensuring ORIGIN_URL points to localhost:3000)
+    ```
+
+4.  **test the proxy:**
+    ```bash
+    curl -i http://localhost:8081/example.html
+    ```
+    expected output:
+    ```text
+    HTTP/1.1 200 OK
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 20 # or similar
+    Server: SimpleHTTP/0.6 Python/3.x.x # or similar
+    Date: ...
+    
+    hello from upstream
+    ```
+
+    example `shadowstep` server logs for this proxied request:
+    ```log
+    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Incoming proxy request: GET /example.html from 127.0.0.1
+    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Forwarding request to: http://localhost:3000/example.html
+    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Received response from upstream: 200
+    [2025-05-10T23:24:05Z INFO  actix_web::middleware::logger] GET /example.html HTTP/1.1 200 20 3.550893 ms 
+    ```
 
 ### health endpoint test
 
