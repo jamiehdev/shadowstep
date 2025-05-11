@@ -9,7 +9,7 @@
 //! 
 
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, middleware::{Compress, Logger}};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use actix_web::http::header::{CACHE_CONTROL, ETAG};
 use std::collections::HashMap;
@@ -18,10 +18,20 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use log::{info, warn};
 use sha2::{Sha256, Digest};
+
+use std::io::BufReader;
+use mime_guess;
+
+// Imports for Hyper client and URL parsing
+use hyper::Client;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use url::Url;
+
 mod config;
 use config::Config;
+mod proxy;
+
 use std::fs::File;
-use std::io::BufReader;
 use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 
@@ -35,7 +45,10 @@ struct CacheStats {
 // application state, including cache
 struct AppState {
     cache_stats: Mutex<CacheStats>,
-    cache: Arc<RwLock<HashMap<String, (Vec<u8>, String)>>>, // (content, etag)
+    cache: Arc<RwLock<HashMap<String, (Vec<u8>, String)>>>, 
+    http_client: Client<HttpsConnector<hyper::client::HttpConnector>>,
+    upstream_base_url: Url,
+    asset_path: PathBuf,
 }
 
 fn load_rustls_config(cert_path: &std::path::Path, key_path: &std::path::Path) -> std::io::Result<RustlsServerConfig> {
@@ -110,9 +123,9 @@ async fn serve_asset(
     }
     
     // if not in cache, read from the filesystem.
-    let path = Path::new("/app/assets").join(&filename);
+    let path = state.asset_path.join(&filename); // Use asset_path from state
     
-    // Debug print
+    // debug print
     println!("Looking for file at: {:?}", path);
     
     match tokio::fs::read(&path).await {
@@ -168,22 +181,31 @@ async fn health_check(state: web::Data<AppState>) -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // ensure the assets directory exists.
-    std::fs::create_dir_all("./assets")
-        .expect("failed to create assets directory");
-    
-    // initialise the logger from environment variables.
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     
-    // load configuration
     let config = Config::load();
+
+    std::fs::create_dir_all(&config.asset_path)
+        .expect("failed to create configured assets directory");
     
-    // set the number of worker threads based on available cpu cores.
+    // create a new HTTPS connector with native-trust roots for TLS
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    
+    let http_client = Client::builder().build(https);
+
+    let upstream_base_url = Url::parse(&config.origin_url)
+        .expect("Failed to parse ORIGIN_URL from config");
+    
+    info!("Proxying requests to: {}", upstream_base_url);
+    info!("Serving assets from: {:?}", config.asset_path);
+    
     let num_workers = num_cpus::get();
-    
     info!("shadowstep starting on {} with {} workers", config.listen_addr, num_workers);
     
-    // initialise application state, including the cache.
     let app_state = web::Data::new(AppState {
         cache_stats: Mutex::new(CacheStats {
             hits: 0,
@@ -191,9 +213,11 @@ async fn main() -> std::io::Result<()> {
             items: 0,
         }),
         cache: Arc::new(RwLock::new(HashMap::new())),
+        http_client, 
+        upstream_base_url, 
+        asset_path: config.asset_path.clone(), 
     });
     
-    // configure and start the http server.
     let mut server = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
@@ -201,6 +225,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::new("%r %s %b %D ms"))
             .service(health_check)
             .service(serve_asset)
+            .route("/{path:.*}", web::to(proxy::forward_to_upstream))
     })
     .keep_alive(Duration::from_secs(75))
     .workers(num_workers);

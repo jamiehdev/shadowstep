@@ -11,6 +11,10 @@ pub struct Config {
     #[clap(long, env = "LISTEN_ADDR", default_value = "0.0.0.0:8080")]
     pub listen_addr: String,
 
+    /// asset path for serving static files
+    #[clap(long, env = "ASSET_PATH", default_value = "/app/assets")]
+    pub asset_path: PathBuf,
+
     /// cache ttl
     #[clap(long, env = "CACHE_TTL_SECONDS", default_value_t = 300)]
     pub cache_ttl_seconds: u64,
