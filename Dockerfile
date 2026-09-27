@@ -1,6 +1,6 @@
 # rust 1.85 is the minimum: the dev-dependencies wiremock and hyper-util use
 # edition 2024, and cargo parses every manifest in Cargo.lock
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 
 WORKDIR /usr/src/shadowstep
 
