@@ -256,7 +256,7 @@ async fn stale_while_revalidate_serves_stale_and_refreshes_in_the_background() {
         ResponseTemplate::new(200)
             .insert_header("cache-control", "max-age=60")
             .set_body_string("new")
-            .set_delay(Duration::from_millis(500)),
+            .set_delay(Duration::from_secs(3)),
     )
     .await;
     let (app, _assets) = common::service(&origin.uri()).await;
@@ -266,8 +266,10 @@ async fn stale_while_revalidate_serves_stale_and_refreshes_in_the_background() {
     let started = Instant::now();
     let stale = test::call_service(&app, get("/page").to_request()).await;
 
+    // a 2 s margin under the origin's delay, so a loaded runner cannot
+    // reach the bound unless the response waited for the origin
     assert!(
-        started.elapsed() < Duration::from_millis(400),
+        started.elapsed() < Duration::from_secs(1),
         "waited for the origin"
     );
     assert_eq!(stale.status(), StatusCode::OK);
@@ -290,7 +292,7 @@ async fn stale_while_revalidate_serves_stale_and_refreshes_in_the_background() {
     assert_eq!(health["cache"]["background_refreshes"], 1);
 }
 
-/// requests `path` until it is a hit, for up to three seconds, and returns
+/// requests `path` until it is a hit, for up to five seconds, and returns
 /// the hit's body.
 async fn wait_for_hit<S, B>(app: &S, path: &str) -> bytes::Bytes
 where
@@ -301,7 +303,7 @@ where
     >,
     B: actix_web::body::MessageBody,
 {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         actix_web::rt::time::sleep(Duration::from_millis(100)).await;
         let resp = test::call_service(app, get(path).to_request()).await;
@@ -311,6 +313,80 @@ where
             return body;
         }
         assert!(Instant::now() < deadline, "no hit, last status {status}");
+    }
+}
+
+#[actix_web::test]
+async fn late_not_modified_leaves_a_newer_entry_in_place() {
+    let origin = MockServer::start().await;
+    // long enough for the no-cache exchange below to finish first
+    Mock::given(header("if-none-match", "\"v1\""))
+        .respond_with(
+            ResponseTemplate::new(304)
+                .insert_header("cache-control", "max-age=60")
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&origin)
+        .await;
+    Mock::given(header("cache-control", "no-cache"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "max-age=60")
+                .insert_header("etag", "\"v2\"")
+                .set_body_string("new"),
+        )
+        .mount(&origin)
+        .await;
+    Mock::given(any())
+        .respond_with(tagged("max-age=1, stale-while-revalidate=10"))
+        .mount(&origin)
+        .await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    test::read_body(test::call_service(&app, get("/page").to_request()).await).await;
+    actix_web::rt::time::sleep(PAST_ONE_SECOND).await;
+    let stale = test::call_service(&app, get("/page").to_request()).await;
+    assert_eq!(cache_status(&stale), "STALE");
+    test::read_body(stale).await;
+    wait_for_origin_requests(&origin, 2).await;
+    assert_eq!(
+        received_header(&origin, 1, "if-none-match")
+            .await
+            .as_deref(),
+        Some("\"v1\"")
+    );
+
+    let reload = get("/page").insert_header(("cache-control", "no-cache"));
+    let reloaded = test::call_service(&app, reload.to_request()).await;
+    assert_eq!(cache_status(&reloaded), "MISS");
+    assert_eq!(test::read_body(reloaded).await.as_ref(), b"new");
+    assert_eq!(
+        health(&app).await["cache"]["revalidations"],
+        0,
+        "the 304 arrived before the no-cache response was stored"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while health(&app).await["cache"]["revalidations"] != 1 {
+        assert!(Instant::now() < deadline, "the 304 never arrived");
+        actix_web::rt::time::sleep(Duration::from_millis(50)).await;
+    }
+    let after = test::call_service(&app, get("/page").to_request()).await;
+    assert_eq!(cache_status(&after), "HIT");
+    assert_eq!(after.headers().get("etag").unwrap(), "\"v2\"");
+    assert_eq!(test::read_body(after).await.as_ref(), b"new");
+    assert_eq!(origin_requests(&origin).await, 3);
+}
+
+/// waits up to five seconds for the origin to have received `n` requests.
+async fn wait_for_origin_requests(origin: &MockServer, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while origin_requests(origin).await < n {
+        assert!(
+            Instant::now() < deadline,
+            "the origin never got request {n}"
+        );
+        actix_web::rt::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
