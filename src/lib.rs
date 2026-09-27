@@ -45,6 +45,7 @@ pub struct AppState {
     http_client: Client<HttpsConnector<HttpConnector>>,
     upstream_base_url: Url,
     asset_path: PathBuf,
+    upstream_timeout: Duration,
 }
 
 #[get("/health")]
@@ -99,6 +100,7 @@ pub fn build_state(config: &Config) -> io::Result<web::Data<AppState>> {
         http_client,
         upstream_base_url,
         asset_path: config.asset_path.clone(),
+        upstream_timeout: Duration::from_secs(config.upstream_timeout_seconds),
     }))
 }
 

@@ -151,6 +151,7 @@ mod tests {
             cache_size_mb: 100,
             tls_cert_path: None,
             tls_key_path: None,
+            upstream_timeout_seconds: 30,
         })
         .unwrap()
     }

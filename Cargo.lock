@@ -1690,6 +1690,7 @@ dependencies = [
  "actix-web",
  "clap",
  "env_logger",
+ "futures-util",
  "hex",
  "hyper 0.14.32",
  "hyper-rustls",

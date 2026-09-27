@@ -1,6 +1,10 @@
-use actix_web::{web, Error, FromRequest, HttpRequest, HttpResponse};
-use hyper::{body::Body, header, Request as HyperRequest, Uri};
-use log::{debug, error};
+use actix_web::body::SizedStream;
+use actix_web::{web, HttpRequest, HttpResponse};
+use futures_util::StreamExt;
+use hyper::body::Body;
+use hyper::header::{self, HeaderName, HeaderValue};
+use hyper::{Request as HyperRequest, Response as HyperResponse, Uri};
+use log::{debug, error, warn};
 use std::convert::TryFrom;
 use url::Position;
 
@@ -8,9 +12,9 @@ use crate::AppState;
 
 pub async fn forward_to_upstream(
     req: HttpRequest,
-    _payload: web::Payload,
+    payload: web::Payload,
     state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
+) -> HttpResponse {
     let client_ip = req
         .connection_info()
         .realip_remote_addr()
@@ -35,8 +39,7 @@ pub async fn forward_to_upstream(
         Ok(uri) => uri,
         Err(e) => {
             error!("Error constructing target URI '{}': {}", target_url_str, e);
-            return Ok(HttpResponse::InternalServerError()
-                .body(format!("Invalid upstream URL configuration: {}", e)));
+            return HttpResponse::InternalServerError().body("internal server error");
         }
     };
 
@@ -46,22 +49,11 @@ pub async fn forward_to_upstream(
         .method(req.method().clone())
         .uri(target_uri.clone());
 
-    // copy headers from the original request to the new HyperRequest
-    // filter out connection-specific headers or headers that might cause issues
+    let options = connection_options(req.headers().get_all(header::CONNECTION));
     for (name, value) in req.headers().iter() {
-        // hop-by-hop headers that should not be blindly forwarded
-        match name {
-            &header::CONNECTION
-            | &header::PROXY_AUTHENTICATE
-            | &header::PROXY_AUTHORIZATION
-            | &header::TE
-            | &header::TRAILER
-            | &header::TRANSFER_ENCODING
-            | &header::UPGRADE
-            | &header::HOST => { /* Do not copy HOST, set it based on upstream_base_url */ }
-            _ => {
-                hyper_req_builder = hyper_req_builder.header(name.clone(), value.clone());
-            }
+        // the Host header is set from upstream_base_url below
+        if name != header::HOST && is_end_to_end(name, &options) {
+            hyper_req_builder = hyper_req_builder.header(name.clone(), value.clone());
         }
     }
 
@@ -88,84 +80,145 @@ pub async fn forward_to_upstream(
         hyper_req_builder.header("X-Forwarded-Proto", req.connection_info().scheme());
     hyper_req_builder = hyper_req_builder.header("X-Forwarded-Host", req.connection_info().host());
 
-    // read the entire body from actix payload and then use it to build hyper request
-    // this addresses the thread safety issue with actix_web::Payload
-    let body_bytes = match web::Bytes::from_request(&req, &mut actix_web::dev::Payload::None).await
-    {
-        Ok(bytes) => bytes,
+    let body = match request_body(payload).await {
+        Ok(body) => body,
         Err(e) => {
-            error!("Failed to read request body: {}", e);
-            return Ok(HttpResponse::InternalServerError().body("Failed to read request body."));
+            warn!("Failed to read request body: {}", e);
+            return HttpResponse::BadRequest().body("bad request");
         }
     };
 
-    let hyper_req = match hyper_req_builder.body(Body::from(body_bytes)) {
+    let hyper_req = match hyper_req_builder.body(body) {
         Ok(req) => req,
         Err(e) => {
             error!("Failed to build hyper request: {}", e);
-            return Ok(HttpResponse::InternalServerError()
-                .body("Failed to construct request for upstream server."));
+            return HttpResponse::InternalServerError().body("internal server error");
         }
     };
 
-    // send the request to the upstream server
-    match state.http_client.request(hyper_req).await {
-        Ok(upstream_response) => {
+    let upstream =
+        tokio::time::timeout(state.upstream_timeout, state.http_client.request(hyper_req)).await;
+
+    match upstream {
+        Ok(Ok(upstream_response)) => {
             debug!(
                 "Received response from upstream: {:?}",
                 upstream_response.status()
             );
-            let mut client_resp_builder = HttpResponse::build(upstream_response.status());
-
-            // copy headers from the upstream response to the client response
-            for (name, value) in upstream_response.headers().iter() {
-                // avoid copying hop-by-hop headers from response too
-                match name {
-                    &header::CONNECTION
-                    | &header::PROXY_AUTHENTICATE
-                    | &header::PROXY_AUTHORIZATION
-                    | &header::TE
-                    | &header::TRAILER
-                    | &header::TRANSFER_ENCODING
-                    | &header::UPGRADE => {}
-                    _ => {
-                        client_resp_builder.append_header((name.clone(), value.clone()));
-                    }
-                }
-            }
-
-            // convert the hyper response body to an actix-web response body
-            let body_bytes = hyper::body::to_bytes(upstream_response.into_body())
-                .await
-                .map_err(|e| {
-                    error!("Error reading upstream response body: {}", e);
-                    actix_web::error::ErrorInternalServerError(format!(
-                        "Failed to read upstream response: {}",
-                        e
-                    ))
-                })?;
-
-            Ok(client_resp_builder.body(body_bytes))
+            client_response(upstream_response)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Error forwarding request to upstream {}: {}", target_uri, e);
-            let error_message = if e.is_connect() {
-                format!(
-                    "Failed to connect to upstream server at {}: {}",
-                    state.upstream_base_url, e
-                )
-            } else if e.is_timeout() {
-                format!(
-                    "Request to upstream server at {} timed out: {}",
-                    state.upstream_base_url, e
-                )
-            } else {
-                format!(
-                    "Error communicating with upstream server at {}: {}",
-                    state.upstream_base_url, e
-                )
-            };
-            Ok(HttpResponse::BadGateway().body(error_message))
+            HttpResponse::BadGateway().body("bad gateway")
+        }
+        Err(_) => {
+            error!(
+                "Upstream {} sent no response headers within {:?}",
+                target_uri, state.upstream_timeout
+            );
+            HttpResponse::GatewayTimeout().body("gateway timeout")
         }
     }
+}
+
+/// the request body for the origin. actix's `Payload` is `!Send` and hyper
+/// needs a `Send` body, so a task on this worker's local executor copies the
+/// payload into a hyper body channel as chunks arrive.
+async fn request_body(mut payload: web::Payload) -> Result<Body, actix_web::error::PayloadError> {
+    // an empty body stays `Body::empty()` so that hyper does not send
+    // `Transfer-Encoding: chunked` on a GET
+    let first = match payload.next().await {
+        None => return Ok(Body::empty()),
+        Some(chunk) => chunk?,
+    };
+
+    let (mut sender, body) = Body::channel();
+    actix_web::rt::spawn(async move {
+        if sender.send_data(first).await.is_err() {
+            return;
+        }
+        while let Some(chunk) = payload.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    // the origin request has ended, so the rest is unwanted
+                    if sender.send_data(chunk).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read request body: {}", e);
+                    sender.abort();
+                    return;
+                }
+            }
+        }
+    });
+    Ok(body)
+}
+
+/// turns the origin's response into the client's, streaming the body. the
+/// response carries the origin's length when it sent one.
+fn client_response(upstream: HyperResponse<Body>) -> HttpResponse {
+    let (parts, body) = upstream.into_parts();
+    let mut builder = HttpResponse::build(parts.status);
+
+    let options = connection_options(parts.headers.get_all(header::CONNECTION));
+    for (name, value) in parts.headers.iter() {
+        // actix writes Content-Length from the body size, so a copied header
+        // would go stale when the Compress middleware re-encodes the body
+        if name != header::CONTENT_LENGTH && is_end_to_end(name, &options) {
+            builder.append_header((name.clone(), value.clone()));
+        }
+    }
+
+    let body = body.map(|chunk| {
+        chunk.map_err(|e| {
+            error!("Error reading upstream response body: {}", e);
+            e
+        })
+    });
+
+    let length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    match length {
+        Some(length) => builder.body(SizedStream::new(length, body)),
+        None => builder.streaming(body),
+    }
+}
+
+/// the lowercased header names that a `Connection` header lists, which are
+/// hop-by-hop for this message (RFC 9110 section 7.6.1).
+fn connection_options<'a>(values: impl IntoIterator<Item = &'a HeaderValue>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// whether a proxy forwards `name`. RFC 9110 section 7.6.1 names
+/// `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Transfer-Encoding`
+/// and `Upgrade`. the proxy auth headers apply to one hop (section 11.7).
+/// `Trailer` goes too, because the body stream drops trailer fields.
+fn is_end_to_end(name: &HeaderName, connection_options: &[String]) -> bool {
+    let name = name.as_str();
+    let hop_by_hop = matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+    );
+    !hop_by_hop && !connection_options.iter().any(|option| option == name)
 }
