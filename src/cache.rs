@@ -408,6 +408,16 @@ fn split_outside_quotes(value: &str) -> Vec<&str> {
     parts
 }
 
+/// request headers through which a client asks the origin to treat the
+/// request as another method. they are forwarded, but the origin may then
+/// answer a GET as if it were a DELETE or POST, so an exchange that carries
+/// one is neither served from nor stored in the cache.
+const METHOD_OVERRIDE_HEADERS: [HeaderName; 3] = [
+    HeaderName::from_static("x-http-method-override"),
+    HeaderName::from_static("x-http-method"),
+    HeaderName::from_static("x-method-override"),
+];
+
 /// what the proxy may do with the cache for one request.
 pub struct RequestPolicy {
     /// whether a stored response may answer the request
@@ -426,12 +436,15 @@ impl RequestPolicy {
         // (RFC 9110 section 9.3.2). request no-cache means the client wants
         // the origin's answer (RFC 9111 section 5.2.1.4), and no-store means
         // nothing about this exchange is kept (section 5.2.1.5).
-        let cacheable_method = *method == Method::GET || *method == Method::HEAD;
+        let cacheable_method = (*method == Method::GET || *method == Method::HEAD)
+            && !METHOD_OVERRIDE_HEADERS
+                .iter()
+                .any(|h| headers.contains_key(h));
         let no_store = directives.malformed || directives.has("no-store");
         RequestPolicy {
             may_serve: cacheable_method && !no_store && !directives.has("no-cache"),
             max_age: directives.seconds("max-age"),
-            may_store: *method == Method::GET && !no_store,
+            may_store: cacheable_method && *method == Method::GET && !no_store,
             has_credentials: headers.contains_key(AUTHORIZATION) || headers.contains_key(COOKIE),
         }
     }

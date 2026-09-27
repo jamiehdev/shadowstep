@@ -861,3 +861,62 @@ async fn head_response_without_length_is_not_stored_for_get() {
     assert_eq!(test::read_body(resp).await.as_ref(), b"full body");
     assert_eq!(served.load(Ordering::SeqCst), 2);
 }
+
+/// headers through which a client asks the origin to treat a request as
+/// another method. the proxy forwards them unchanged.
+const METHOD_OVERRIDE_HEADERS: [&str; 3] = [
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+];
+
+#[actix_web::test]
+async fn method_override_get_is_not_stored() {
+    let origin = origin_responding(ok_with("max-age=60")).await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let overridden = test::call_service(
+        &app,
+        get("/page")
+            .insert_header(("x-http-method-override", "DELETE"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(cache_status(&overridden), "MISS");
+    test::read_body(overridden).await;
+
+    let plain = test::call_service(&app, get("/page").to_request()).await;
+    assert_eq!(cache_status(&plain), "MISS");
+    test::read_body(plain).await;
+
+    assert_eq!(origin_requests(&origin).await, 2);
+}
+
+#[actix_web::test]
+async fn stored_response_is_not_served_to_method_override_get() {
+    for name in METHOD_OVERRIDE_HEADERS {
+        let origin = origin_responding(ok_with("max-age=60")).await;
+        let (app, _assets) = common::service(&origin.uri()).await;
+
+        test::read_body(test::call_service(&app, get("/page").to_request()).await).await;
+        let overridden = test::call_service(
+            &app,
+            get("/page").insert_header((name, "DELETE")).to_request(),
+        )
+        .await;
+
+        assert_eq!(
+            cache_status(&overridden),
+            "MISS",
+            "{name} got a stored response"
+        );
+        test::read_body(overridden).await;
+        let received = origin.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "{name} did not reach the origin");
+        assert_eq!(
+            received[1].headers.get(name).unwrap(),
+            "DELETE",
+            "{name} was not forwarded"
+        );
+    }
+}
