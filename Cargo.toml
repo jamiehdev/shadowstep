@@ -26,6 +26,7 @@ moka = { version = "0.12", features = ["sync"] }
 bytes = "1"
 httpdate = "1.0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot = "0.12"
 
 [profile.release]
 lto = true

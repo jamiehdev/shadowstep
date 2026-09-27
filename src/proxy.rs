@@ -1,12 +1,12 @@
 use actix_web::body::SizedStream;
 use actix_web::error::PayloadError;
 use actix_web::http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use actix_web::http::StatusCode;
+use actix_web::http::{Method, StatusCode};
 use actix_web::{web, HttpRequest, HttpResponse};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Empty, StreamBody};
+use http_body_util::{BodyExt, Empty, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Request as HyperRequest, Uri};
 use log::{debug, error, warn};
@@ -16,7 +16,10 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use url::{Position, Url};
 
-use crate::cache::{self, Fields, PrimaryKey, RequestPolicy, StoredResponse};
+use crate::cache::{
+    self, Fields, Lookup, PrimaryKey, RequestPolicy, StaleEntry, StoredResponse,
+    PRECONDITION_HEADERS,
+};
 use crate::forwarded::{ClientInfo, CLIENT_FORWARDING_HEADERS, URL_OVERRIDE_HEADERS};
 use crate::AppState;
 
@@ -46,35 +49,46 @@ pub async fn forward_to_upstream(
     // X-Forwarded-Proto and X-Forwarded-Host that the origin receives
     let cache_key = PrimaryKey::new(client.scheme, &client.host, path_and_query);
     let request_policy = RequestPolicy::new(req.method(), req.headers());
-    if let Some(hit) = serve_from_cache(&req, &state, &cache_key, &request_policy) {
-        return hit;
-    }
-    state.cache_stats.miss();
+    let stale = match from_cache(&req, &state, &cache_key, &request_policy) {
+        Cached::Answer(response) => return response,
+        Cached::Stale(entry) => Some(entry),
+        Cached::Nothing => None,
+    };
 
-    let Some((hyper_req_builder, target_uri)) =
-        upstream_request(&req, &state, &client, path_and_query)
+    let Some((builder, target_uri)) = upstream_request(&req, &state, &client, path_and_query)
     else {
-        return HttpResponse::InternalServerError().body("internal server error");
+        state.cache_stats.miss();
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    // a client's own preconditions go to the origin unchanged, and then the
+    // origin's answer is for the client, not for the stored response
+    let revalidating = stale.as_ref().filter(|_| !request_policy.conditional);
+    let builder = match revalidating {
+        Some(entry) => with_validators(builder, &entry.response),
+        None => builder,
+    };
+    let exchange = Exchange {
+        revalidating: revalidating.is_some(),
+        req,
+        state,
+        cache_key,
+        request_policy,
+        stale,
     };
 
-    let body = match request_body(payload).await {
-        Ok(body) => body,
-        Err(e) => {
-            warn!("Failed to read request body: {}", e);
-            return HttpResponse::BadRequest().body("bad request");
+    let hyper_req = match origin_request(builder, payload).await {
+        Ok(hyper_req) => hyper_req,
+        Err(status) => {
+            exchange.state.cache_stats.miss();
+            return error_response(status);
         }
     };
 
-    let hyper_req = match hyper_req_builder.body(body) {
-        Ok(req) => req,
-        Err(e) => {
-            error!("Failed to build hyper request: {}", e);
-            return HttpResponse::InternalServerError().body("internal server error");
-        }
-    };
-
-    let upstream =
-        tokio::time::timeout(state.upstream_timeout, state.http_client.request(hyper_req)).await;
+    let upstream = tokio::time::timeout(
+        exchange.state.upstream_timeout,
+        exchange.state.http_client.request(hyper_req),
+    )
+    .await;
 
     match upstream {
         Ok(Ok(upstream_response)) => {
@@ -82,42 +96,285 @@ pub async fn forward_to_upstream(
                 "Received response from upstream: {:?}",
                 upstream_response.status()
             );
-            let (parts, body) = upstream_response.into_parts();
-            let head = Head::from_upstream(&parts);
-            let store = store_plan(&req, &state, cache_key, &request_policy, &head);
-            client_response(head, body, store)
+            exchange.answered(upstream_response)
         }
         Ok(Err(e)) => {
             error!("Error forwarding request to upstream {}: {}", target_uri, e);
-            HttpResponse::BadGateway().body("bad gateway")
+            exchange.failed(StatusCode::BAD_GATEWAY)
         }
         Err(_) => {
             error!(
                 "Upstream {} sent no response headers within {:?}",
-                target_uri, state.upstream_timeout
+                target_uri, exchange.state.upstream_timeout
             );
-            HttpResponse::GatewayTimeout().body("gateway timeout")
+            exchange.failed(StatusCode::GATEWAY_TIMEOUT)
         }
     }
 }
 
-/// the client's response from the cache, when a fresh stored response may
-/// answer this request.
-fn serve_from_cache(
+/// what the cache can do for a request before it goes to the origin.
+enum Cached {
+    /// the cache answers the request
+    Answer(HttpResponse),
+    /// the request goes to the origin to revalidate this stored response
+    Stale(StaleEntry),
+    /// the request goes to the origin
+    Nothing,
+}
+
+/// the stored response for this request, if any, and whether it answers the
+/// request. only GET requests use stale responses, because a revalidation
+/// or a stored replacement needs a GET to the origin.
+fn from_cache(
     req: &HttpRequest,
-    state: &AppState,
+    state: &web::Data<AppState>,
     cache_key: &PrimaryKey,
     request_policy: &RequestPolicy,
-) -> Option<HttpResponse> {
+) -> Cached {
     if !request_policy.may_serve {
-        return None;
+        return Cached::Nothing;
     }
-    let stored = state
+    match state
         .cache
-        .lookup(cache_key, req.headers(), request_policy.max_age)?;
-    debug!("Cache hit for {} {}", req.method(), req.uri());
-    state.cache_stats.hit();
-    Some(stored_response(&stored))
+        .lookup(cache_key, req.headers(), request_policy.max_age)
+    {
+        Some(Lookup::Fresh(stored)) => {
+            debug!("Cache hit for {} {}", req.method(), req.uri());
+            state.cache_stats.hit();
+            Cached::Answer(cached_response(&stored, "HIT"))
+        }
+        Some(Lookup::Stale(entry)) if req.method() == Method::GET => {
+            while_revalidating(req, state, cache_key, request_policy, entry)
+        }
+        _ => Cached::Nothing,
+    }
+}
+
+/// the stale response and a background revalidation when the response's
+/// stale-while-revalidate window allows it (RFC 5861 section 3), or else
+/// the entry to revalidate before use.
+fn while_revalidating(
+    req: &HttpRequest,
+    state: &web::Data<AppState>,
+    cache_key: &PrimaryKey,
+    request_policy: &RequestPolicy,
+    entry: StaleEntry,
+) -> Cached {
+    if !request_policy.may_serve_stale() || !entry.response.may_serve_while_revalidating() {
+        return Cached::Stale(entry);
+    }
+    debug!("Serving stale {} while revalidating", req.uri());
+    state.cache_stats.stale();
+    let response = cached_response(&entry.response, "STALE");
+    refresh_in_background(req, state, cache_key.clone(), entry);
+    Cached::Answer(response)
+}
+
+/// revalidates `entry` in a task on this worker, unless another task is
+/// already revalidating it. the origin request is built as for a miss, with
+/// the stored validators in place of the client's preconditions.
+fn refresh_in_background(
+    req: &HttpRequest,
+    state: &web::Data<AppState>,
+    cache_key: PrimaryKey,
+    entry: StaleEntry,
+) {
+    let Some(guard) = state.cache.start_refresh(&entry) else {
+        return;
+    };
+    let client = ClientInfo::from_request(req);
+    let path_and_query = req.uri().path_and_query().map_or("", |pq| pq.as_str());
+    let Some((mut builder, target_uri)) = upstream_request(req, state, &client, path_and_query)
+    else {
+        return;
+    };
+    if let Some(headers) = builder.headers_mut() {
+        for name in &PRECONDITION_HEADERS {
+            headers.remove(name.as_str());
+        }
+    }
+    let Ok(hyper_req) = with_validators(builder, &entry.response).body(empty_body()) else {
+        return;
+    };
+    state.cache_stats.background_refresh();
+    let (req, state) = (req.clone(), state.clone());
+    actix_web::rt::spawn(async move {
+        let _guard = guard;
+        let upstream =
+            tokio::time::timeout(state.upstream_timeout, state.http_client.request(hyper_req))
+                .await;
+        match upstream {
+            Ok(Ok(response)) => refresh(&req, &state, cache_key, &entry, response).await,
+            Ok(Err(e)) => warn!("Background revalidation of {} failed: {}", target_uri, e),
+            Err(_) => warn!("Background revalidation of {} timed out", target_uri),
+        }
+    });
+}
+
+/// updates `entry` from the origin's answer to a background revalidation: a
+/// 304 freshens it, and a storable response replaces it. anything else
+/// leaves it for its stale windows.
+async fn refresh(
+    req: &HttpRequest,
+    state: &AppState,
+    cache_key: PrimaryKey,
+    entry: &StaleEntry,
+    response: hyper::Response<Incoming>,
+) {
+    let (parts, body) = response.into_parts();
+    let head = Head::from_upstream(&parts);
+    let request_policy = RequestPolicy::new(req.method(), req.headers());
+    if head.status == StatusCode::NOT_MODIFIED {
+        state.cache.freshen(
+            entry,
+            &request_policy,
+            req.headers(),
+            &stored_fields(forwardable_fields(&head)),
+            head.map.get(header::AGE),
+        );
+        state.cache_stats.revalidation();
+        return;
+    }
+    let Some(store) = store_plan(req, state, cache_key, &request_policy, &head) else {
+        return;
+    };
+    let limit = usize::try_from(store.limit).unwrap_or(usize::MAX);
+    match Limited::new(body, limit).collect().await {
+        Ok(collected) => (store.finish)(
+            head.status,
+            stored_fields(forwardable_fields(&head)),
+            collected.to_bytes(),
+        ),
+        Err(e) => debug!("Background revalidation body not stored: {}", e),
+    }
+}
+
+/// statuses for which stale-if-error serves a stale response in place of
+/// the origin's (RFC 5861 section 4).
+const ERROR_STATUSES: [StatusCode; 4] = [
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::BAD_GATEWAY,
+    StatusCode::SERVICE_UNAVAILABLE,
+    StatusCode::GATEWAY_TIMEOUT,
+];
+
+/// one request on its way to the origin, and the stored response it may
+/// revalidate.
+struct Exchange {
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    cache_key: PrimaryKey,
+    request_policy: RequestPolicy,
+    stale: Option<StaleEntry>,
+    /// whether the origin request carries the stale response's validators
+    revalidating: bool,
+}
+
+impl Exchange {
+    /// the client's response once the origin has answered.
+    fn answered(self, response: hyper::Response<Incoming>) -> HttpResponse {
+        let (parts, body) = response.into_parts();
+        let head = Head::from_upstream(&parts);
+        if let Some(stale) = &self.stale {
+            if self.revalidating && head.status == StatusCode::NOT_MODIFIED {
+                return self.revalidated(stale, &head);
+            }
+            if ERROR_STATUSES.contains(&head.status) && self.may_serve_on_error(stale) {
+                return self.serve_stale(stale);
+            }
+        }
+        self.state.cache_stats.miss();
+        let store = store_plan(
+            &self.req,
+            &self.state,
+            self.cache_key,
+            &self.request_policy,
+            &head,
+        );
+        client_response(head, body, store)
+    }
+
+    /// the client's response when the origin could not be reached or sent no
+    /// response headers in time. a response that must be revalidated gets a
+    /// 504 (RFC 9111 section 5.2.2.2).
+    fn failed(self, status: StatusCode) -> HttpResponse {
+        let mut status = status;
+        if let Some(stale) = &self.stale {
+            if self.may_serve_on_error(stale) {
+                return self.serve_stale(stale);
+            }
+            if stale.response.must_revalidate() {
+                status = StatusCode::GATEWAY_TIMEOUT;
+            }
+        }
+        self.state.cache_stats.miss();
+        error_response(status)
+    }
+
+    fn may_serve_on_error(&self, stale: &StaleEntry) -> bool {
+        self.request_policy.may_serve_stale() && stale.response.may_serve_on_error()
+    }
+
+    fn serve_stale(&self, stale: &StaleEntry) -> HttpResponse {
+        debug!(
+            "Serving stale {} in place of an origin error",
+            self.req.uri()
+        );
+        self.state.cache_stats.stale();
+        cached_response(&stale.response, "STALE")
+    }
+
+    /// the stored body with the fields of the origin's 304, which also
+    /// freshens the stored response.
+    fn revalidated(&self, stale: &StaleEntry, head: &Head) -> HttpResponse {
+        let fresh = self.state.cache.freshen(
+            stale,
+            &self.request_policy,
+            self.req.headers(),
+            &stored_fields(forwardable_fields(head)),
+            head.map.get(header::AGE),
+        );
+        self.state.cache_stats.revalidation();
+        cached_response(&fresh, "REVALIDATED")
+    }
+}
+
+/// `builder` with the conditional fields from `stored`'s validators (RFC
+/// 9111 section 4.3.1).
+fn with_validators(
+    mut builder: hyper::http::request::Builder,
+    stored: &StoredResponse,
+) -> hyper::http::request::Builder {
+    for (name, value) in stored.validators() {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    builder
+}
+
+/// the origin request from `builder` and the client's body, or the status
+/// of the client's error response.
+async fn origin_request(
+    builder: hyper::http::request::Builder,
+    payload: web::Payload,
+) -> Result<HyperRequest<UpstreamBody>, StatusCode> {
+    let body = request_body(payload).await.map_err(|e| {
+        warn!("Failed to read request body: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    builder.body(body).map_err(|e| {
+        error!("Failed to build hyper request: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// a plain error response, such as "bad gateway" for a 502.
+fn error_response(status: StatusCode) -> HttpResponse {
+    let reason = status.canonical_reason().unwrap_or_default();
+    HttpResponse::build(status).body(reason.to_ascii_lowercase())
+}
+
+fn empty_body() -> UpstreamBody {
+    Empty::new().map_err(|never| match never {}).boxed_unsync()
 }
 
 /// the origin request for `req`, without its body, and its target URI.
@@ -200,7 +457,7 @@ fn store_plan(
     Some(Storing {
         limit: state.cache.max_entry(),
         finish: Box::new(move |status, headers, body| {
-            cache.insert_response(cache_key, vary, &storable, status, headers, body)
+            cache.insert_response(cache_key, vary, &storable, status, headers, body);
         }),
     })
 }
@@ -212,7 +469,7 @@ async fn request_body(mut payload: web::Payload) -> Result<UpstreamBody, Payload
     // an empty body stays empty so that hyper does not send
     // `Transfer-Encoding: chunked` on a GET
     let first = match payload.next().await {
-        None => return Ok(Empty::new().map_err(|never| match never {}).boxed_unsync()),
+        None => return Ok(empty_body()),
         Some(chunk) => chunk?,
     };
 
@@ -303,19 +560,12 @@ struct BodyCopy {
 fn client_response(head: Head, body: Incoming, store: Option<Storing>) -> HttpResponse {
     let mut builder = HttpResponse::build(head.status);
 
-    let options = connection_options(head.map.get_all(header::CONNECTION));
-    let mut stored_headers = Vec::new();
-    for (name, value) in &head.fields {
-        // actix writes Content-Length from the body size, so a copied header
-        // would go stale when the Compress middleware re-encodes the body
-        if name != header::CONTENT_LENGTH && name != CACHE_STATUS && is_end_to_end(name, &options) {
-            builder.append_header((name.clone(), value.clone()));
-            if name != header::AGE {
-                stored_headers.push((name.clone(), value.clone()));
-            }
-        }
+    let fields = forwardable_fields(&head);
+    for (name, value) in &fields {
+        builder.append_header((name.clone(), value.clone()));
     }
     builder.insert_header((CACHE_STATUS, "MISS"));
+    let stored_headers = stored_fields(fields);
 
     // the data stream drops trailer frames
     let body = body.into_data_stream().map(|chunk| {
@@ -347,16 +597,37 @@ fn client_response(head: Head, body: Incoming, store: Option<Storing>) -> HttpRe
     }
 }
 
-/// the client's response from a stored one (RFC 9111 section 4). actix
-/// leaves the body out when it answers a HEAD request.
-fn stored_response(stored: &StoredResponse) -> HttpResponse {
+/// the origin response's fields that go to the client.
+fn forwardable_fields(head: &Head) -> Fields {
+    let options = connection_options(head.map.get_all(header::CONNECTION));
+    head.fields
+        .iter()
+        // actix writes Content-Length from the body size, so a copied header
+        // would go stale when the Compress middleware re-encodes the body
+        .filter(|(name, _)| {
+            name != header::CONTENT_LENGTH && name != CACHE_STATUS && is_end_to_end(name, &options)
+        })
+        .cloned()
+        .collect()
+}
+
+/// forwardable fields without `Age`, which the store works out on each use.
+fn stored_fields(mut fields: Fields) -> Fields {
+    fields.retain(|(name, _)| name != header::AGE);
+    fields
+}
+
+/// the client's response from a stored one (RFC 9111 section 4), marked
+/// with `cache_status`. actix leaves the body out when it answers a HEAD
+/// request.
+fn cached_response(stored: &StoredResponse, cache_status: &'static str) -> HttpResponse {
     let mut builder = HttpResponse::build(stored.status);
     for (name, value) in &stored.headers {
         builder.append_header((name.clone(), value.clone()));
     }
     builder
         .insert_header((header::AGE, stored.age().as_secs().to_string()))
-        .insert_header((CACHE_STATUS, "HIT"))
+        .insert_header((CACHE_STATUS, cache_status))
         .body(stored.body.clone())
 }
 
