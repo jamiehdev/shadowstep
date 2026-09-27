@@ -10,6 +10,7 @@ use http_body_util::{BodyExt, Empty, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Request as HyperRequest, Uri};
 use log::{debug, error, warn};
+use prometheus::IntCounter;
 use std::convert::TryFrom;
 use std::future::Future;
 use std::io;
@@ -17,6 +18,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::error::Elapsed;
 use tokio::time::{Instant, Sleep};
 use url::{Position, Url};
 
@@ -26,7 +28,8 @@ use crate::cache::{
 };
 use crate::coalesce::{FlightGuard, Join, Waiter};
 use crate::forwarded::{ClientInfo, CLIENT_FORWARDING_HEADERS, URL_OVERRIDE_HEADERS};
-use crate::{AppState, CacheStats};
+use crate::metrics::{self, OriginFailure, OriginKind, Route};
+use crate::AppState;
 
 const CACHE_STATUS: &str = "x-shadowstep-cache";
 
@@ -37,10 +40,34 @@ pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, BodyError>;
 
 type Flight = FlightGuard<FlightKey>;
 
+type OriginError = hyper_util::client::legacy::Error;
+
 pub async fn forward_to_upstream(
     req: HttpRequest,
     payload: web::Payload,
     state: web::Data<AppState>,
+) -> HttpResponse {
+    let request_policy = RequestPolicy::new(req.method(), req.headers());
+    let bypass = request_policy.bypasses_cache();
+    let response = forward(req, payload, state.clone(), request_policy).await;
+    // an error response carries no `X-Shadowstep-Cache`, and it came from
+    // the origin exchange, so it counts as a miss
+    let cache = if bypass {
+        metrics::BYPASS
+    } else {
+        metrics::cache_label(&response).unwrap_or(metrics::MISS)
+    };
+    state
+        .metrics
+        .observe(Route::Proxy, cache, response.status());
+    response
+}
+
+async fn forward(
+    req: HttpRequest,
+    payload: web::Payload,
+    state: web::Data<AppState>,
+    request_policy: RequestPolicy,
 ) -> HttpResponse {
     let client = ClientInfo::from_request(&req);
 
@@ -55,7 +82,6 @@ pub async fn forward_to_upstream(
     // the key takes scheme and host from `ClientInfo`, the source of the
     // X-Forwarded-Proto and X-Forwarded-Host that the origin receives
     let cache_key = PrimaryKey::new(client.scheme, &client.host, path_and_query);
-    let request_policy = RequestPolicy::new(req.method(), req.headers());
     let ToOrigin { stale, flight } =
         match serve_from_cache(&req, &state, &cache_key, &request_policy).await {
             Before::Answer(response) => return response,
@@ -64,7 +90,6 @@ pub async fn forward_to_upstream(
 
     let Some((builder, target_uri)) = upstream_request(&req, &state, &client, path_and_query)
     else {
-        state.cache_stats.miss();
         return error_response(StatusCode::INTERNAL_SERVER_ERROR);
     };
     // a client's own preconditions go to the origin unchanged, and then the
@@ -86,19 +111,10 @@ pub async fn forward_to_upstream(
 
     let hyper_req = match origin_request(builder, payload).await {
         Ok(hyper_req) => hyper_req,
-        Err(status) => {
-            exchange.state.cache_stats.miss();
-            return error_response(status);
-        }
+        Err(status) => return error_response(status),
     };
 
-    let upstream = tokio::time::timeout(
-        exchange.state.upstream_timeout,
-        exchange.state.http_client.request(hyper_req),
-    )
-    .await;
-
-    match upstream {
+    match send_to_origin(&exchange.state, OriginKind::Foreground, hyper_req).await {
         Ok(Ok(upstream_response)) => {
             debug!(
                 "Received response from upstream: {:?}",
@@ -206,17 +222,11 @@ enum FreshUse {
 }
 
 impl FreshUse {
-    /// counts the use and returns its `X-Shadowstep-Cache` value.
-    fn count(self, stats: &CacheStats) -> &'static str {
+    /// the use's `X-Shadowstep-Cache` value.
+    fn cache_status(self) -> &'static str {
         match self {
-            FreshUse::Hit => {
-                stats.hit();
-                "HIT"
-            }
-            FreshUse::Coalesced => {
-                stats.coalesced();
-                "COALESCED"
-            }
+            FreshUse::Hit => metrics::HIT,
+            FreshUse::Coalesced => metrics::COALESCED,
         }
     }
 }
@@ -262,8 +272,7 @@ fn from_cache(
     {
         Some(Lookup::Fresh(stored)) => {
             debug!("Cache hit for {} {}", req.method(), req.uri());
-            let cache_status = fresh_use.count(&state.cache_stats);
-            Cached::Answer(cached_response(&stored, cache_status))
+            Cached::Answer(cached_response(&stored, fresh_use.cache_status()))
         }
         Some(Lookup::Stale(entry)) if req.method() == Method::GET => {
             while_revalidating(req, state, cache_key, request_policy, entry)
@@ -286,8 +295,7 @@ fn while_revalidating(
         return Cached::Stale(entry);
     }
     debug!("Serving stale {} while revalidating", req.uri());
-    state.cache_stats.stale();
-    let response = cached_response(&entry.response, "STALE");
+    let response = cached_response(&entry.response, metrics::STALE);
     refresh_in_background(req, state, cache_key.clone(), entry);
     Cached::Answer(response)
 }
@@ -318,14 +326,11 @@ fn refresh_in_background(
     let Ok(hyper_req) = with_validators(builder, &entry.response).body(empty_body()) else {
         return;
     };
-    state.cache_stats.background_refresh();
+    state.metrics.background_refresh();
     let (req, state) = (req.clone(), state.clone());
     actix_web::rt::spawn(async move {
         let _guard = guard;
-        let upstream =
-            tokio::time::timeout(state.upstream_timeout, state.http_client.request(hyper_req))
-                .await;
-        match upstream {
+        match send_to_origin(&state, OriginKind::Background, hyper_req).await {
             Ok(Ok(response)) => {
                 refresh(&req, &state, cache_key, &entry, response, target_uri).await
             }
@@ -357,14 +362,15 @@ async fn refresh(
             &stored_fields(forwardable_fields(&head)),
             head.map.get(header::AGE),
         );
-        state.cache_stats.revalidation();
+        state.metrics.revalidation();
         return;
     }
     let Some(store) = store_plan(req, state, cache_key, &request_policy, &head) else {
         return;
     };
     let limit = usize::try_from(store.limit).unwrap_or(usize::MAX);
-    let body = origin_body(body, state.upstream_timeout, target_uri);
+    let idle_timeouts = state.metrics.body_idle_timeouts(OriginKind::Background);
+    let body = origin_body(body, state.upstream_timeout, target_uri, idle_timeouts);
     let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
     match Limited::new(body, limit).collect().await {
         Ok(collected) => (store.finish)(
@@ -413,7 +419,6 @@ impl Exchange {
                 return self.serve_stale(stale);
             }
         }
-        self.state.cache_stats.miss();
         let flight = self.flight;
         let store = store_plan(
             &self.req,
@@ -422,7 +427,11 @@ impl Exchange {
             &self.request_policy,
             &head,
         );
-        let body = origin_body(body, self.state.upstream_timeout, target_uri);
+        let idle_timeouts = self
+            .state
+            .metrics
+            .body_idle_timeouts(OriginKind::Foreground);
+        let body = origin_body(body, self.state.upstream_timeout, target_uri, idle_timeouts);
         client_response(head, body, store.map(|store| store.holding(flight)))
     }
 
@@ -439,7 +448,6 @@ impl Exchange {
                 status = StatusCode::GATEWAY_TIMEOUT;
             }
         }
-        self.state.cache_stats.miss();
         error_response(status)
     }
 
@@ -452,8 +460,7 @@ impl Exchange {
             "Serving stale {} in place of an origin error",
             self.req.uri()
         );
-        self.state.cache_stats.stale();
-        cached_response(&stale.response, "STALE")
+        cached_response(&stale.response, metrics::STALE)
     }
 
     /// the stored body with the fields of the origin's 304, which also
@@ -466,9 +473,32 @@ impl Exchange {
             &stored_fields(forwardable_fields(head)),
             head.map.get(header::AGE),
         );
-        self.state.cache_stats.revalidation();
-        cached_response(&fresh, "REVALIDATED")
+        self.state.metrics.revalidation();
+        cached_response(&fresh, metrics::REVALIDATED)
     }
+}
+
+/// sends `request` to the origin and waits up to the upstream timeout for
+/// its response headers, counting the outcome as `kind`.
+async fn send_to_origin(
+    state: &AppState,
+    kind: OriginKind,
+    request: HyperRequest<UpstreamBody>,
+) -> Result<Result<hyper::Response<Incoming>, OriginError>, Elapsed> {
+    let started = Instant::now();
+    let upstream =
+        tokio::time::timeout(state.upstream_timeout, state.http_client.request(request)).await;
+    match &upstream {
+        Ok(Ok(response)) => {
+            let status = response.status().as_u16();
+            state
+                .metrics
+                .origin_responded(kind, status, started.elapsed());
+        }
+        Ok(Err(_)) => state.metrics.origin_failed(kind, OriginFailure::Error),
+        Err(_) => state.metrics.origin_failed(kind, OriginFailure::Timeout),
+    }
+    upstream
 }
 
 /// `builder` with the conditional fields from `stored`'s validators (RFC
@@ -716,7 +746,7 @@ where
     for (name, value) in &fields {
         builder.append_header((name.clone(), value.clone()));
     }
-    builder.insert_header((CACHE_STATUS, "MISS"));
+    builder.insert_header((CACHE_STATUS, metrics::MISS));
     let stored_headers = stored_fields(fields);
 
     let length = head
@@ -781,6 +811,7 @@ fn origin_body(
     body: Incoming,
     idle: Duration,
     target_uri: Uri,
+    idle_timeouts: IntCounter,
 ) -> IdleTimeout<impl Stream<Item = io::Result<Bytes>> + Unpin> {
     // the data stream drops trailer frames
     let body = body.into_data_stream().map(|chunk| {
@@ -796,6 +827,7 @@ fn origin_body(
         waiting: false,
         expired: false,
         target_uri,
+        idle_timeouts,
     }
 }
 
@@ -812,6 +844,8 @@ struct IdleTimeout<S> {
     waiting: bool,
     expired: bool,
     target_uri: Uri,
+    /// counts this body if it goes idle
+    idle_timeouts: IntCounter,
 }
 
 impl<S> Stream for IdleTimeout<S>
@@ -835,6 +869,7 @@ where
         }
         std::task::ready!(this.sleep.as_mut().poll(cx));
         this.expired = true;
+        this.idle_timeouts.inc();
         warn!(
             "Upstream {} sent no response body data for {:?}",
             this.target_uri, this.idle

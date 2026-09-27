@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::Asset;
+use crate::metrics::{self, Route};
 use crate::AppState;
 
 /// resolves `requested` to a file inside `root`, or `None` if it is missing
@@ -34,14 +35,23 @@ pub async fn serve_asset(
     state: web::Data<AppState>,
     req: HttpRequest,
 ) -> impl Responder {
-    let filename = path.into_inner();
+    let response = asset_response(path.into_inner(), &state, &req).await;
+    // a response without `X-Shadowstep-Cache` found no file, so the cache
+    // was never consulted
+    let cache = metrics::cache_label(&response).unwrap_or(metrics::BYPASS);
+    state
+        .metrics
+        .observe(Route::Asset, cache, response.status());
+    response
+}
 
+async fn asset_response(filename: String, state: &AppState, req: &HttpRequest) -> HttpResponse {
     let Some(path) = resolve_asset(&state.asset_path, &filename).await else {
         warn!("Asset not found: {}", filename);
         return HttpResponse::NotFound().body("not found");
     };
 
-    let (asset, status) = match load(&state, path).await {
+    let (asset, status) = match load(state, path).await {
         Ok(loaded) => loaded,
         Err(e) => {
             warn!("Asset not found: {} - Error: {}", filename, e);
@@ -82,18 +92,16 @@ async fn load(state: &AppState, path: PathBuf) -> std::io::Result<(Arc<Asset>, &
 
     if let Some(asset) = state.cache.asset(&path) {
         if asset.modified == modified && asset.len == metadata.len() {
-            state.cache_stats.hit();
-            return Ok((asset, "HIT"));
+            return Ok((asset, metrics::HIT));
         }
     }
 
     debug!("Reading asset from {:?}", path);
     let content = Bytes::from(tokio::fs::read(&path).await?);
     let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&content))[..32]);
-    state.cache_stats.miss();
     Ok((
         state.cache.insert_asset(path, content, etag, modified),
-        "MISS",
+        metrics::MISS,
     ))
 }
 
@@ -126,6 +134,7 @@ mod tests {
             tls_key_path: None,
             tls_listen_addr: "127.0.0.1:0".into(),
             upstream_timeout_seconds: 30,
+            metrics_addr: None,
         })
         .unwrap()
     }

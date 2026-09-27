@@ -41,6 +41,12 @@ pub struct Config {
     /// body before the proxy closes the client's connection.
     #[clap(long, env = "UPSTREAM_TIMEOUT_SECONDS", default_value_t = 30)]
     pub upstream_timeout_seconds: u64,
+
+    /// address for a listener that serves only `/metrics`. when it is set,
+    /// the proxy listeners forward `/metrics` to the origin like any other
+    /// path. when it is unset, they serve `/metrics` as they serve `/health`.
+    #[clap(long, env = "METRICS_ADDR")]
+    pub metrics_addr: Option<String>,
 }
 
 impl Config {
