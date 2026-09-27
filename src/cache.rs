@@ -414,7 +414,8 @@ pub struct RequestPolicy {
     pub may_serve: bool,
     /// the oldest stored response the client accepts
     pub max_age: Option<Duration>,
-    no_store: bool,
+    /// whether the origin's response may be stored
+    may_store: bool,
     has_credentials: bool,
 }
 
@@ -430,7 +431,7 @@ impl RequestPolicy {
         RequestPolicy {
             may_serve: cacheable_method && !no_store && !directives.has("no-cache"),
             max_age: directives.seconds("max-age"),
-            no_store,
+            may_store: *method == Method::GET && !no_store,
             has_credentials: headers.contains_key(AUTHORIZATION) || headers.contains_key(COOKIE),
         }
     }
@@ -455,13 +456,12 @@ const UNSTORABLE_DIRECTIVES: [&str; 3] = ["no-store", "private", "no-cache"];
 /// whether a shared cache may store the origin's response to a request
 /// (RFC 9111 section 3), and the request's `Vary` values for its key.
 pub fn storable(
-    method: &Method,
     request_policy: &RequestPolicy,
     request: &RequestHeaders,
     status: StatusCode,
     response: &HeaderMap,
 ) -> Option<(Storable, Vary)> {
-    if *method != Method::GET || request_policy.no_store {
+    if !request_policy.may_store {
         return None;
     }
     let directives = storable_response_directives(status, response)?;

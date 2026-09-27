@@ -15,6 +15,16 @@ pub(crate) const CLIENT_FORWARDING_HEADERS: [HeaderName; 7] = [
     HeaderName::from_static("x-real-ip"),
 ];
 
+/// request headers that override the request path in some origin
+/// frameworks: IIS URL Rewrite sets them, and Symfony trusted them until
+/// CVE-2018-14773. the cache key does not hold them, so a client could have
+/// one path's response stored under another. shadowstep removes them before
+/// forwarding.
+pub(crate) const URL_OVERRIDE_HEADERS: [HeaderName; 2] = [
+    HeaderName::from_static("x-original-url"),
+    HeaderName::from_static("x-rewrite-url"),
+];
+
 /// the client's address, scheme and host, taken only from the connection and
 /// the request target. unlike actix's `ConnectionInfo`, it never reads
 /// `Forwarded` or `X-Forwarded-*`, which the client controls.
