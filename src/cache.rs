@@ -693,6 +693,12 @@ impl RequestPolicy {
         }
     }
 
+    /// whether the cache can neither answer the request nor store its
+    /// response, as for a POST or a request with `no-store`.
+    pub fn bypasses_cache(&self) -> bool {
+        !self.may_serve && !self.may_store
+    }
+
     /// whether a stale response may answer the request. a request max-age
     /// asks for a response no older than that, so it rules out stale ones
     /// (RFC 9111 section 5.2.1.1).

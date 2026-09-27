@@ -5,6 +5,7 @@ mod coalescing;
 mod common;
 mod forwarded;
 mod http2;
+mod metrics;
 mod proxy;
 mod revalidation;
 mod smoke;

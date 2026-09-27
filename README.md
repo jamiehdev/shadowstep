@@ -9,6 +9,7 @@ A small caching reverse proxy written in Rust (actix-web 4, hyper 1, rustls 0.23
 - Every other path is forwarded to the origin with its method, path, query, headers and body. See [Proxying](#proxying).
 - Cacheable origin responses are stored and served from memory. See [Caching](#caching).
 - `GET /health` returns `{"status":"ok","cache":{...}}` with `hits`, `misses`, `hit_ratio`, `items` and `bytes` for the cache.
+- `GET /metrics` returns Prometheus metrics. See [Metrics](#metrics).
 - Responses are compressed according to the request's `Accept-Encoding`.
 - HTTPS is served when both a certificate and a key are given. See [TLS](#tls).
 
@@ -114,6 +115,8 @@ Assets share the same cache. A stored asset is read from disk again when the fil
 
 `background_refreshes` counts background revalidations started. `hit_ratio` is the share of responses whose body came from the cache: hits, revalidations, stale and coalesced responses. `items` and `bytes` describe the whole cache.
 
+`/health` reads the same counters as `/metrics`, so the two always agree. `misses` is the sum of the `MISS` series and the proxy's `BYPASS` series of `shadowstep_requests_total`.
+
 Known limits:
 
 - A response with `Cache-Control: no-cache` is not stored, although RFC 9111 allows storing it and revalidating it on every use.
@@ -121,6 +124,40 @@ Known limits:
 - Requests with `Cookie` do not coalesce. If browsers send a cookie with every request to the site, only cookieless clients coalesce.
 - The host is part of the key, so a client that sends many different `Host` values can create many entries. The byte bound on the cache still applies.
 - Each process has its own cache. Replicas do not share entries or invalidations.
+
+## Metrics
+
+`GET /metrics` returns metrics in the Prometheus text format 0.0.4, with `Content-Type: text/plain; version=0.0.4; charset=utf-8`. Each process has its own counters, which start at 0.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `shadowstep_requests_total` | counter | `route`, `cache` | Proxied and asset requests. `route` is `proxy` or `asset`. `cache` is the response's `X-Shadowstep-Cache` value, or `BYPASS` for a request that the cache could neither answer nor store |
+| `shadowstep_responses_total` | counter | `route`, `status_class` | Responses to proxied and asset requests, by status class: `1xx` to `5xx` |
+| `shadowstep_origin_requests_total` | counter | `kind`, `outcome` | Requests to the origin. `kind` is `foreground` for a client's request or `background` for a `stale-while-revalidate` revalidation. `outcome` is the status class of the origin's response, `error` when the connection or request failed, or `timeout` when no response headers arrived within `--upstream-timeout-seconds` |
+| `shadowstep_origin_body_idle_timeouts_total` | counter | `kind` | Origin response bodies given up because the origin sent nothing for `--upstream-timeout-seconds` |
+| `shadowstep_origin_response_seconds` | histogram | none | Time from sending an origin request to receiving its response headers, for both kinds. Buckets run from 5 ms to 30 s |
+| `shadowstep_cache_revalidations_total` | counter | none | 304 responses that freshened a stored response, in the foreground or the background |
+| `shadowstep_cache_background_refreshes_total` | counter | none | Background revalidations started |
+| `shadowstep_cache_bytes` | gauge | none | Bytes held in the cache, read at scrape time |
+| `shadowstep_cache_entries` | gauge | none | Entries in the cache, read at scrape time |
+
+Notes on the counts:
+
+- `BYPASS` covers, among others, methods other than `GET` and `HEAD`, requests with `Cache-Control: no-store`, requests with a method-override header, and asset requests that found no file. The response itself still carries `X-Shadowstep-Cache: MISS` for a proxied bypass.
+- A proxied error response, such as a 502 or a 504, counts as `MISS`.
+- Stale and coalesced responses are the `STALE` and `COALESCED` series of `shadowstep_requests_total`, so they have no metric of their own.
+- An origin request counts once in `shadowstep_origin_requests_total`, when its headers arrive or it fails. A body that later goes idle counts again in `shadowstep_origin_body_idle_timeouts_total` but not in `shadowstep_origin_requests_total`, so the latter's total stays the number of origin requests.
+- The histogram observes only origin requests whose headers arrived. Its `_count` equals the sum of the status-class outcomes of `shadowstep_origin_requests_total`.
+- No label holds a path, host or query, so the number of series is fixed.
+- Requests to `/health` and `/metrics` are not counted.
+
+### Exposure
+
+By default `/metrics` is served on the HTTP and HTTPS listeners, as `/health` is. On a public edge node anyone can then read it. The metrics hold aggregate counts, a latency histogram and the cache size, and `/health` already shows most of these counts to anyone.
+
+To keep `/metrics` off the public listeners, set `--metrics-addr` to an address that only the scraper can reach, for example `127.0.0.1:9090` or a pod IP port that no Service exposes. shadowstep then serves `/metrics` only on that listener, which answers 404 to every other path and proxies nothing.
+
+`/health`, and `/metrics` without `--metrics-addr`, shadow the same paths on the origin: a client cannot reach the origin's own `/health` or `/metrics` through shadowstep. With `--metrics-addr` set, `/metrics` on the proxy listeners goes to the origin like any other path.
 
 ## Install
 
@@ -184,6 +221,7 @@ Each option can be set with a flag or an environment variable. The flag wins if 
 | `--tls-key` | `TLS_KEY_PATH` | none | PEM private key in PKCS#8 form |
 | `--tls-listen-addr` | `TLS_LISTEN_ADDR` | `0.0.0.0:8443` | Address for the HTTPS listener, used only when both TLS paths are set |
 | `--upstream-timeout-seconds` | `UPSTREAM_TIMEOUT_SECONDS` | `30` | Seconds to wait for the origin's response headers before answering 504, and the longest the origin may send nothing during a response body |
+| `--metrics-addr` | `METRICS_ADDR` | none | Address for a listener that serves only `/metrics`. When set, the proxy listeners forward `/metrics` to the origin. When unset, they serve `/metrics` themselves. See [Metrics](#metrics) |
 
 `cargo run -- --help` prints the same list.
 
@@ -259,6 +297,8 @@ The Service maps port 80 to 8080 and 443 to 8443. Readiness and liveness probes 
 
 `CACHE_SIZE_MB` is set to 100 against a 256Mi memory limit. Change the two together.
 
+The Deployment has no `prometheus.io/scrape` annotations. They are a convention of some Prometheus scrape configs, not a Kubernetes or Prometheus standard, and the Prometheus Operator ignores them in favour of a `ServiceMonitor` or `PodMonitor`. Configure scraping of `/metrics` on port 8080 in whichever way the cluster's Prometheus expects. To keep `/metrics` off the LoadBalancer, set `METRICS_ADDR` to `0.0.0.0:9090`, add a container port for it and leave it out of the Service.
+
 The Deployment runs two replicas, and each has its own cache. `X-Forwarded-For` holds whatever source address reaches the pod. With the Service's default `externalTrafficPolicy: Cluster`, that is often a node address rather than the client's.
 
 ## Tests
@@ -275,6 +315,7 @@ Unit tests in `src/assets.rs` cover asset path traversal, `src/cache.rs` covers 
 - `forwarded.rs`: removal and replacement of forwarding headers
 - `cache.rs`: origin response caching
 - `revalidation.rs`: conditional requests, `stale-while-revalidate`, `stale-if-error` and `must-revalidate`
+- `metrics.rs`: each `/metrics` series, its agreement with `/health`, and `--metrics-addr`
 
 CI also runs:
 

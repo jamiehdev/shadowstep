@@ -1,8 +1,9 @@
 use log::info;
 use shadowstep::config::Config;
 use shadowstep::tls::bind_listeners;
-use shadowstep::{build_state, run};
+use shadowstep::{build_state, run, run_metrics};
 use std::io;
+use std::net::TcpListener;
 use std::num::NonZeroUsize;
 
 #[actix_web::main]
@@ -19,6 +20,13 @@ async fn main() -> io::Result<()> {
     );
 
     let (http, tls) = bind_listeners(&config)?;
+    let proxy = run(state.clone(), http, tls, num_workers)?;
 
-    run(state, http, tls, num_workers)?.await
+    let Some(metrics_addr) = &config.metrics_addr else {
+        return proxy.await;
+    };
+    info!("Serving /metrics on {}", metrics_addr);
+    let metrics = run_metrics(state, TcpListener::bind(metrics_addr)?)?;
+    // each server stops on SIGINT or SIGTERM, so both end together
+    tokio::try_join!(proxy, metrics).map(|_| ())
 }
