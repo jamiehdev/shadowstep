@@ -194,16 +194,25 @@ docker run --rm \
 
 The image exposes 8080 and 8443. If you change `LISTEN_ADDR` or `TLS_LISTEN_ADDR`, publish the matching ports.
 
-The container runs as user `shadowstep` (uid 1000), so the mounted key file must be readable by that uid.
+The container runs as user `shadowstep` (uid 1000), so the mounted key file must be readable by that uid. `openssl req` writes the key with mode 0600, owned by you. On a Linux host where your uid is not 1000, the container exits with `Permission denied`. Add `--user "$(id -u)"` to `docker run` to read the key as your own uid. Docker Desktop on macOS shows bind-mounted files as owned by the container's user, so the 0600 key works there without changes.
 
 ## Kubernetes
 
-`k8s/` holds a Deployment and a LoadBalancer Service. Before applying them, set the image and `ORIGIN_URL` in `k8s/deployment.yaml` and create the TLS Secret the Deployment mounts at `/etc/tls`:
+`k8s/` holds a Deployment and a LoadBalancer Service. The Deployment runs `ghcr.io/jamiehdev/shadowstep:2.0.0`. Before applying them, set `ORIGIN_URL` in `k8s/deployment.yaml` and create the TLS Secret the Deployment mounts at `/etc/tls`:
 
 ```bash
 kubectl create secret tls shadowstep-tls --cert=certs/cert.pem --key=certs/key.pem
 kubectl apply -f k8s/
 ```
+
+To run a local build in a [kind](https://kind.sigs.k8s.io/) cluster instead, load the image into the cluster and point the Deployment at it after applying:
+
+```bash
+kind load docker-image shadowstep:local
+kubectl set image deployment/shadowstep shadowstep=shadowstep:local
+```
+
+A tag other than `latest` gets the default `imagePullPolicy: IfNotPresent`, so the nodes use the loaded image.
 
 The Service maps port 80 to 8080 and 443 to 8443. Readiness and liveness probes call `/health` on port 8080. To run without TLS, remove the `TLS_CERT_PATH`, `TLS_KEY_PATH` and `TLS_LISTEN_ADDR` variables, the `tls` volume and mount, and the `https` ports.
 
@@ -232,6 +241,8 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
+
+A second CI job builds the Docker image without pushing it, then checks that the container runs as uid 1000 and answers `/health`.
 
 ## Licence
 
