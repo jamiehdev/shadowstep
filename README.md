@@ -34,7 +34,7 @@ The origin then receives one of each of these headers:
 
 There is no trusted-proxy setting. Behind another load balancer or proxy, `X-Forwarded-For` holds that proxy's address, and any forwarding headers that proxy adds are removed.
 
-`--upstream-timeout-seconds` (default 30) limits how long shadowstep waits for the origin's response headers, including the time to send the request body. The limit does not cover the response body.
+`--upstream-timeout-seconds` (default 30) limits how long shadowstep waits for the origin's response headers, including the time to send the request body. It also limits how long the origin may send nothing while the proxy waits for the next part of the response body. The body may take longer in total, as long as data keeps arriving. When the origin stays silent for longer, shadowstep logs a warning and closes the client's connection before the body is complete: a response with `Content-Length` ends short, and a chunked response gets no last chunk. The proxy does not store that response.
 
 Error responses have short generic bodies:
 
@@ -98,7 +98,7 @@ When several requests miss on the same key at once, the first one, the leader, g
 
 - Only `GET` and `HEAD` requests that may be served from the cache wait. A request with `Authorization`, `Cookie`, a conditional header, request `Cache-Control: no-cache` or `no-store`, or a method-override header goes to the origin as before.
 - Only a `GET` leads. A `HEAD` request with no `GET` in flight goes to the origin.
-- The leader's response streams to its client as usual. The waiting requests look up the cache once the response is stored, or once the proxy knows it will not be stored: it is not storable, its body passes the entry size limit or fails, the leader's client disconnects, or the origin fails or times out.
+- The leader's response streams to its client as usual. The waiting requests look up the cache once the response is stored, or once the proxy knows it will not be stored: it is not storable, its body passes the entry size limit or fails, the leader's client disconnects, or the origin fails, times out or stops sending the body.
 - A waiting request gets the stored response with `X-Shadowstep-Cache: COALESCED`. If the cache has nothing it may use, for example because the response was `private` or had `Vary` values that differ from the waiting request's, the waiting request goes to the origin on its own. One client's uncacheable response never goes to another client.
 - A request waits for at most `--upstream-timeout-seconds`, then goes to the origin on its own.
 
@@ -119,7 +119,6 @@ Known limits:
 - A response with `Cache-Control: no-cache` is not stored, although RFC 9111 allows storing it and revalidating it on every use.
 - A stored response is never used to answer a client's conditional request with a 304. A fresh hit always gets the full response.
 - Requests with `Cookie` do not coalesce. If browsers send a cookie with every request to the site, only cookieless clients coalesce.
-- The proxy notices that a client has disconnected only when it next writes to it. If the leader's client disconnects while the origin has stopped sending the body, the waiting requests go to the origin after `--upstream-timeout-seconds`.
 - The host is part of the key, so a client that sends many different `Host` values can create many entries. The byte bound on the cache still applies.
 - Each process has its own cache. Replicas do not share entries or invalidations.
 
@@ -184,7 +183,7 @@ Each option can be set with a flag or an environment variable. The flag wins if 
 | `--tls-cert` | `TLS_CERT_PATH` | none | PEM certificate chain |
 | `--tls-key` | `TLS_KEY_PATH` | none | PEM private key in PKCS#8 form |
 | `--tls-listen-addr` | `TLS_LISTEN_ADDR` | `0.0.0.0:8443` | Address for the HTTPS listener, used only when both TLS paths are set |
-| `--upstream-timeout-seconds` | `UPSTREAM_TIMEOUT_SECONDS` | `30` | Seconds to wait for the origin's response headers before answering 504 |
+| `--upstream-timeout-seconds` | `UPSTREAM_TIMEOUT_SECONDS` | `30` | Seconds to wait for the origin's response headers before answering 504, and the longest the origin may send nothing during a response body |
 
 `cargo run -- --help` prints the same list.
 

@@ -551,6 +551,37 @@ async fn followers_of_a_stalled_leader_stop_waiting_after_the_upstream_timeout()
 }
 
 #[actix_web::test]
+async fn followers_of_a_leader_whose_body_stalls_are_released_when_it_is_given_up() {
+    let (origin_url, connections) = origin_slowing_the_first_body(FirstBody::Stall).await;
+    let server = common::spawn_workers(&origin_url, WORKERS, |c| {
+        c.upstream_timeout_seconds = 1;
+    });
+    let client = common::client();
+
+    let mut leader = raw_leader(&server).await;
+    let stalled = Instant::now();
+    let followers = spawn_followers(&client, &server).await;
+    let mut rest = Vec::new();
+    timeout(PATIENCE, leader.read_to_end(&mut rest))
+        .await
+        .expect("the proxy kept the leader's connection open")
+        .ok();
+    let given_up = stalled.elapsed();
+    let followers = followers.await.unwrap();
+
+    assert!(given_up < Duration::from_millis(2500), "took {given_up:?}");
+    assert!(
+        stalled.elapsed() < given_up + Duration::from_secs(1),
+        "followers took {:?} after the leader was given up at {given_up:?}",
+        stalled.elapsed()
+    );
+    assert_own_whole_responses(&followers);
+    assert_eq!(connections.load(Ordering::SeqCst), 1 + FOLLOWERS);
+    assert_eq!(health(&client, &server).await["cache"]["coalesced"], 0);
+    server.stop().await;
+}
+
+#[actix_web::test]
 async fn requests_that_bypass_the_cache_do_not_coalesce() {
     let origin = origin_responding(cacheable("body")).await;
     let server = common::spawn_workers(&origin.uri(), WORKERS, |_| {});
