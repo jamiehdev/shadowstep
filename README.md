@@ -23,6 +23,7 @@ Hop-by-hop headers are removed in both directions: `Connection`, `Keep-Alive`, `
 shadowstep expects to face clients directly. It removes these client-sent headers and never reads them:
 
 - `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Forwarded-Server` and `X-Real-IP`
+- `X-Forwarded-Prefix`, `X-Forwarded-Uri`, `X-Forwarded-Scheme`, `X-Host`, `X-Original-Host` and `Front-End-Https`, which some origin frameworks use to build links and redirects
 - `X-Original-URL` and `X-Rewrite-URL`, which some origin frameworks use to override the request path
 
 The origin then receives one of each of these headers:
@@ -39,7 +40,7 @@ Error responses have short generic bodies:
 
 - `502 Bad Gateway`: the origin could not be reached or the connection failed
 - `504 Gateway Timeout`: no response headers within the upstream timeout
-- `400 Bad Request`: the request body could not be read
+- `400 Bad Request`: reading the request body failed before any of it was sent to the origin
 - `500 Internal Server Error`: the upstream URL or request could not be built
 
 ## Caching
@@ -62,6 +63,7 @@ For each request:
 - Request `Cache-Control: no-cache` skips the stored copy, goes to the origin and stores the new response.
 - Request `Cache-Control: no-store` is neither served from the cache nor stored.
 - Request `Cache-Control: max-age=N` skips stored copies older than `N` seconds.
+- A request with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` is forwarded with that header, but is neither served from the cache nor stored, because the origin may treat it as another method.
 - A request with an unsafe method, such as `POST`, `PUT` or `DELETE`, that gets a 2xx or 3xx response removes the stored response for its URL.
 
 Responses served from the cache carry `Age`. Proxied and asset responses carry `X-Shadowstep-Cache: HIT` or `MISS`.
