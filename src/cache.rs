@@ -61,6 +61,15 @@ struct ResponseKey {
     vary: Vec<Option<String>>,
 }
 
+/// the key that concurrent requests coalesce on: the primary key and the
+/// request's values for the `Vary` field names the store knows for it, so
+/// that requests for different known variants do not wait for each other.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct FlightKey {
+    primary: PrimaryKey,
+    vary: Vec<Option<String>>,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum Key {
     Asset(PathBuf),
@@ -386,6 +395,23 @@ impl Store {
         Some(Lookup::Stale(StaleEntry { response, key }))
     }
 
+    /// the coalescing key for a request, or `None` when the store keeps
+    /// nothing, so that no request could be answered from a leader's
+    /// response.
+    pub fn flight_key(&self, primary: &PrimaryKey, request: &HeaderMap) -> Option<FlightKey> {
+        if !self.enabled() {
+            return None;
+        }
+        let vary = self
+            .index
+            .get(primary)
+            .map_or_else(Vec::new, |index| vary_values(&index.vary, request));
+        Some(FlightKey {
+            primary: primary.clone(),
+            vary,
+        })
+    }
+
     /// claims the background revalidation of `entry`, or `None` when one is
     /// already running.
     pub fn start_refresh(&self, entry: &StaleEntry) -> Option<RefreshGuard> {
@@ -672,6 +698,21 @@ impl RequestPolicy {
     /// (RFC 9111 section 5.2.1.1).
     pub fn may_serve_stale(&self) -> bool {
         self.max_age.is_none()
+    }
+
+    /// whether the request may wait for a concurrent request for the same
+    /// key and then be answered from the cache. a request with credentials
+    /// does not, because the origin may answer it for that user alone, and
+    /// neither does one with its own preconditions, whose answer is for
+    /// that client.
+    pub fn may_coalesce(&self) -> bool {
+        self.may_serve && !self.has_credentials && !self.conditional
+    }
+
+    /// whether other requests may wait for this one's response to be
+    /// stored. only a GET's response is stored.
+    pub fn may_lead(&self) -> bool {
+        self.may_coalesce() && self.may_store
     }
 }
 

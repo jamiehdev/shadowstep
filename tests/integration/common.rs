@@ -95,10 +95,20 @@ pub fn spawn(origin_url: &str) -> Running {
 
 /// `spawn` with a customised config.
 pub fn spawn_with(origin_url: &str, customise: impl FnOnce(&mut Config)) -> Running {
+    spawn_workers(origin_url, 1, customise)
+}
+
+/// `spawn_with` on `workers` worker threads, so that concurrent connections
+/// can land on different workers.
+pub fn spawn_workers(
+    origin_url: &str,
+    workers: usize,
+    customise: impl FnOnce(&mut Config),
+) -> Running {
     let (state, assets) = state_with(origin_url, customise);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = run(state, listener, None, 1).unwrap();
+    let server = run(state, listener, None, workers).unwrap();
     let handle = server.handle();
     actix_web::rt::spawn(server);
     Running {

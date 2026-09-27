@@ -72,6 +72,7 @@ Responses served from the cache carry `Age`. Proxied and asset responses carry `
 - `MISS`: the origin's response.
 - `REVALIDATED`: the origin answered a conditional request with `304 Not Modified`, and the client got the stored body with the 304's header fields.
 - `STALE`: a stale stored response, served under `stale-while-revalidate` or `stale-if-error`.
+- `COALESCED`: a response that a concurrent request for the same key stored while this request waited for it. See [Request coalescing](#request-coalescing).
 
 `--cache-ttl-seconds` (default 300) caps the freshness lifetime of any entry, whatever the origin sent. `--cache-size-mb` (default 100) bounds origin responses and assets together, measured in bytes. The largest single entry is 8 MiB or the cache size, whichever is smaller. Larger bodies stream to the client without being stored. Setting either option to 0 turns caching off.
 
@@ -91,6 +92,16 @@ A `GET` that finds a stale response sends the origin `If-None-Match` from the st
 
 A response with `must-revalidate`, `proxy-revalidate` or `s-maxage` is never served stale, whatever its stale windows. If the origin cannot be reached to revalidate it, the client gets `504 Gateway Timeout`. A request with `Cache-Control: max-age` never gets a stale response. `HEAD` requests are answered only from fresh responses.
 
+### Request coalescing
+
+When several requests miss on the same key at once, the first one, the leader, goes to the origin and the others wait for it. The key is the scheme, host, path and query, plus the request's values for the `Vary` field names of the latest stored response for that URL, if the cache has one. Requests for different known variants therefore do not wait for each other. Requests that find a stale response they must revalidate coalesce the same way, so the origin gets one conditional request.
+
+- Only `GET` and `HEAD` requests that may be served from the cache wait. A request with `Authorization`, `Cookie`, a conditional header, request `Cache-Control: no-cache` or `no-store`, or a method-override header goes to the origin as before.
+- Only a `GET` leads. A `HEAD` request with no `GET` in flight goes to the origin.
+- The leader's response streams to its client as usual. The waiting requests look up the cache once the response is stored, or once the proxy knows it will not be stored: it is not storable, its body passes the entry size limit or fails, the leader's client disconnects, or the origin fails or times out.
+- A waiting request gets the stored response with `X-Shadowstep-Cache: COALESCED`. If the cache has nothing it may use, for example because the response was `private` or had `Vary` values that differ from the waiting request's, the waiting request goes to the origin on its own. One client's uncacheable response never goes to another client.
+- A request waits for at most `--upstream-timeout-seconds`, then goes to the origin on its own.
+
 Assets share the same cache. A stored asset is read from disk again when the file's size or modified time changes.
 
 `/health` counts responses for proxied requests and assets together. Each response counts once:
@@ -99,14 +110,16 @@ Assets share the same cache. A stored asset is read from disk again when the fil
 - `misses`: responses from the origin, including errors.
 - `revalidations`: 304s that freshened a stored response, in the foreground or the background.
 - `stale`: stale responses served under `stale-while-revalidate` or `stale-if-error`.
+- `coalesced`: responses stored by a concurrent request that this request waited for.
 
-`background_refreshes` counts background revalidations started. `hit_ratio` is the share of responses whose body came from the cache: hits, revalidations and stale responses. `items` and `bytes` describe the whole cache.
+`background_refreshes` counts background revalidations started. `hit_ratio` is the share of responses whose body came from the cache: hits, revalidations, stale and coalesced responses. `items` and `bytes` describe the whole cache.
 
 Known limits:
 
 - A response with `Cache-Control: no-cache` is not stored, although RFC 9111 allows storing it and revalidating it on every use.
 - A stored response is never used to answer a client's conditional request with a 304. A fresh hit always gets the full response.
-- There is no request coalescing. Concurrent misses for the same URL all go to the origin.
+- Requests with `Cookie` do not coalesce. If browsers send a cookie with every request to the site, only cookieless clients coalesce.
+- The proxy notices that a client has disconnected only when it next writes to it. If the leader's client disconnects while the origin has stopped sending the body, the waiting requests go to the origin after `--upstream-timeout-seconds`.
 - The host is part of the key, so a client that sends many different `Host` values can create many entries. The byte bound on the cache still applies.
 - Each process has its own cache. Replicas do not share entries or invalidations.
 
