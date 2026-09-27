@@ -3,15 +3,21 @@ use actix_web::HttpRequest;
 use std::net::IpAddr;
 
 /// request headers through which a client can claim a different address,
-/// host or scheme. shadowstep faces clients directly, so it trusts none of
-/// them and removes them all before forwarding.
-pub(crate) const CLIENT_FORWARDING_HEADERS: [HeaderName; 7] = [
+/// host, scheme or path prefix. some origin frameworks build links from
+/// them, such as Spring from `X-Forwarded-Prefix` and some PHP frameworks
+/// from `X-Host`, and the cache key does not hold them. shadowstep faces
+/// clients directly, so it trusts none of them and removes them all before
+/// forwarding.
+pub(crate) const CLIENT_FORWARDING_HEADERS: [HeaderName; 10] = [
     header::FORWARDED,
     HeaderName::from_static("x-forwarded-for"),
     HeaderName::from_static("x-forwarded-host"),
     HeaderName::from_static("x-forwarded-proto"),
     HeaderName::from_static("x-forwarded-port"),
     HeaderName::from_static("x-forwarded-server"),
+    HeaderName::from_static("x-forwarded-prefix"),
+    HeaderName::from_static("x-forwarded-uri"),
+    HeaderName::from_static("x-host"),
     HeaderName::from_static("x-real-ip"),
 ];
 

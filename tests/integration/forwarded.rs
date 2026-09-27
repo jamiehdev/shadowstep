@@ -104,3 +104,20 @@ async fn client_x_real_ip_and_other_forwarding_headers_are_dropped() {
     }
     assert_eq!(values(&received, "x-forwarded-for"), ["127.0.0.1"]);
 }
+
+#[actix_web::test]
+async fn client_prefix_uri_and_host_claims_are_dropped() {
+    let cases = [
+        ("x-forwarded-prefix", "/evil"),
+        ("x-forwarded-uri", "/admin"),
+        ("x-host", "evil.example"),
+    ];
+    for (name, value) in cases {
+        let (received, _) = forwarded_request(&[(name, value)]).await;
+
+        assert!(
+            received.headers.get(name).is_none(),
+            "{name} reached the origin"
+        );
+    }
+}
