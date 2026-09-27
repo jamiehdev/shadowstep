@@ -1938,6 +1938,7 @@ dependencies = [
  "log",
  "mime_guess",
  "moka",
+ "parking_lot",
  "rcgen",
  "rustls",
  "serde_json",

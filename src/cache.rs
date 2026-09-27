@@ -6,10 +6,11 @@ use actix_web::http::{Method, StatusCode};
 use bytes::Bytes;
 use moka::sync::Cache;
 use moka::Expiry;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 const MIB: u64 = 1024 * 1024;
@@ -225,15 +226,8 @@ pub struct RefreshGuard {
 
 impl Drop for RefreshGuard {
     fn drop(&mut self) {
-        lock(&self.refreshing).remove(&self.key);
+        self.refreshing.lock().remove(&self.key);
     }
-}
-
-/// the set of keys being refreshed. a panic while the lock is held cannot
-/// leave the set inconsistent, so a poisoned lock is still usable.
-fn lock(set: &Mutex<HashSet<ResponseKey>>) -> std::sync::MutexGuard<'_, HashSet<ResponseKey>> {
-    set.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn entry_weight(key: &Key, entry: &Entry) -> u32 {
@@ -395,7 +389,8 @@ impl Store {
     /// claims the background revalidation of `entry`, or `None` when one is
     /// already running.
     pub fn start_refresh(&self, entry: &StaleEntry) -> Option<RefreshGuard> {
-        lock(&self.refreshing)
+        self.refreshing
+            .lock()
             .insert(entry.key.clone())
             .then(|| RefreshGuard {
                 refreshing: self.refreshing.clone(),
