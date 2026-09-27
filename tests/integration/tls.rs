@@ -26,12 +26,12 @@ fn self_signed_cert() -> (TempDir, Vec<u8>) {
 }
 
 /// a proxy for `origin_url` listening on HTTP and HTTPS ports, both
-/// ephemeral. returns the HTTPS address, the server handle, the
+/// ephemeral. returns the HTTPS and HTTP addresses, the server handle, the
 /// certificate DER for the client to trust, and the directories to keep.
 fn spawn_tls(
     origin_url: &str,
 ) -> (
-    SocketAddr,
+    (SocketAddr, SocketAddr),
     actix_web::dev::ServerHandle,
     Vec<u8>,
     (TempDir, TempDir),
@@ -46,11 +46,12 @@ fn spawn_tls(
     let (http, tls) = bind_listeners(&config).unwrap();
     let (https, tls_config) = tls.expect("both tls paths are set");
     let https_addr = https.local_addr().unwrap();
+    let http_addr = http.local_addr().unwrap();
 
     let server = run(state, http, Some((https, tls_config)), 1).unwrap();
     let handle = server.handle();
     actix_web::rt::spawn(server);
-    (https_addr, handle, cert_der, (certs, assets))
+    ((https_addr, http_addr), handle, cert_der, (certs, assets))
 }
 
 /// sends the raw HTTP/1.1 `request` over TLS to `addr`, trusting only
@@ -76,7 +77,7 @@ async fn tls_exchange(addr: SocketAddr, cert_der: Vec<u8>, request: &[u8]) -> St
 
 #[actix_web::test]
 async fn https_listener_binds_tls_listen_addr_and_completes_handshake() {
-    let (https_addr, handle, cert_der, _dirs) = spawn_tls(&common::unreachable_origin());
+    let ((https_addr, _), handle, cert_der, _dirs) = spawn_tls(&common::unreachable_origin());
     assert_eq!(https_addr.ip().to_string(), "127.0.0.1");
     assert_ne!(https_addr.port(), 8443);
 
@@ -103,7 +104,7 @@ async fn https_request_reaches_origin_as_https_whatever_the_client_claims() {
         .expect(1)
         .mount(&origin)
         .await;
-    let (https_addr, handle, cert_der, _dirs) = spawn_tls(&origin.uri());
+    let ((https_addr, _), handle, cert_der, _dirs) = spawn_tls(&origin.uri());
 
     let response = tls_exchange(
         https_addr,
@@ -132,6 +133,57 @@ async fn https_request_reaches_origin_as_https_whatever_the_client_claims() {
     assert_eq!(values("x-forwarded-host"), ["localhost"]);
     assert_eq!(values("x-forwarded-for"), ["127.0.0.1"]);
 
+    handle.stop(true).await;
+}
+
+/// answers with a cacheable body holding the `X-Forwarded-Proto` value the
+/// origin received.
+struct EchoForwardedProto;
+
+impl wiremock::Respond for EchoForwardedProto {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let proto = request.headers.get("x-forwarded-proto").unwrap();
+        ResponseTemplate::new(200)
+            .insert_header("cache-control", "max-age=60")
+            .set_body_string(proto.to_str().unwrap())
+    }
+}
+
+#[actix_web::test]
+async fn https_and_http_responses_are_cached_apart() {
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(EchoForwardedProto)
+        .mount(&origin)
+        .await;
+    let ((https_addr, http_addr), handle, cert_der, _dirs) = spawn_tls(&origin.uri());
+    let request = b"GET /page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    let first = tls_exchange(https_addr, cert_der.clone(), request).await;
+    let client = hyper::Client::new();
+    // the same Host, so that only the scheme tells the two requests apart
+    let plain = client
+        .request(
+            hyper::Request::get(format!("http://{http_addr}/page"))
+                .header("host", "localhost")
+                .body(hyper::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let plain_status = plain.headers()["x-shadowstep-cache"].clone();
+    let plain_body = hyper::body::to_bytes(plain.into_body()).await.unwrap();
+    let second = tls_exchange(https_addr, cert_der, request).await;
+
+    assert!(first.contains("x-shadowstep-cache: MISS"), "{first}");
+    assert!(first.ends_with("https"), "{first}");
+    assert_eq!(plain_status, "MISS");
+    assert_eq!(plain_body.as_ref(), b"http");
+    assert!(second.contains("x-shadowstep-cache: HIT"), "{second}");
+    assert!(second.ends_with("https"), "{second}");
+    assert_eq!(origin.received_requests().await.unwrap().len(), 2);
+
+    drop(client);
     handle.stop(true).await;
 }
 

@@ -11,6 +11,7 @@ pub mod config;
 pub mod tls;
 
 mod assets;
+mod cache;
 mod forwarded;
 mod proxy;
 
@@ -25,24 +26,34 @@ use log::info;
 use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use url::Url;
 
-use crate::assets::AssetCache;
+use crate::cache::Store;
 use crate::config::Config;
 
-/// cache statistics tracker
+/// hits and misses across origin responses and local assets
+#[derive(Default)]
 pub struct CacheStats {
-    hits: usize,
-    misses: usize,
-    items: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl CacheStats {
+    fn hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// application state, including cache
 pub struct AppState {
-    cache_stats: Mutex<CacheStats>,
-    cache: AssetCache,
+    cache_stats: CacheStats,
+    cache: Store,
     http_client: Client<HttpsConnector<HttpConnector>>,
     upstream_base_url: Url,
     asset_path: PathBuf,
@@ -51,15 +62,17 @@ pub struct AppState {
 
 #[get("/health")]
 async fn health_check(state: web::Data<AppState>) -> impl Responder {
-    let stats = state.cache_stats.lock().unwrap();
+    let hits = state.cache_stats.hits.load(Ordering::Relaxed);
+    let misses = state.cache_stats.misses.load(Ordering::Relaxed);
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "cache": {
-            "hits": stats.hits,
-            "misses": stats.misses,
-            "items": stats.items,
-            "hit_ratio": if stats.hits + stats.misses > 0 {
-                stats.hits as f32 / (stats.hits + stats.misses) as f32
+            "hits": hits,
+            "misses": misses,
+            "items": state.cache.entry_count(),
+            "bytes": state.cache.weighted_size(),
+            "hit_ratio": if hits + misses > 0 {
+                hits as f64 / (hits + misses) as f64
             } else {
                 0.0
             }
@@ -92,12 +105,11 @@ pub fn build_state(config: &Config) -> io::Result<web::Data<AppState>> {
     info!("Serving assets from: {:?}", config.asset_path);
 
     Ok(web::Data::new(AppState {
-        cache_stats: Mutex::new(CacheStats {
-            hits: 0,
-            misses: 0,
-            items: 0,
-        }),
-        cache: AssetCache::default(),
+        cache_stats: CacheStats::default(),
+        cache: Store::new(
+            config.cache_size_mb,
+            Duration::from_secs(config.cache_ttl_seconds),
+        ),
         http_client,
         upstream_base_url,
         asset_path: config.asset_path.clone(),

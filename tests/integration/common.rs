@@ -84,7 +84,12 @@ impl Running {
 }
 
 pub fn spawn(origin_url: &str) -> Running {
-    let (state, assets) = state_with(origin_url, |_| {});
+    spawn_with(origin_url, |_| {})
+}
+
+/// `spawn` with a customised config.
+pub fn spawn_with(origin_url: &str, customise: impl FnOnce(&mut Config)) -> Running {
+    let (state, assets) = state_with(origin_url, customise);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = run(state, listener, None, 1).unwrap();
@@ -104,4 +109,12 @@ pub fn unreachable_origin() -> String {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     format!("http://{addr}")
+}
+
+/// the `X-Shadowstep-Cache` value on a response, or "" when it is absent.
+pub fn cache_status<B>(resp: &ServiceResponse<B>) -> String {
+    resp.headers()
+        .get("x-shadowstep-cache")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default()
 }

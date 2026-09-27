@@ -1,16 +1,13 @@
-use actix_web::http::header::{CACHE_CONTROL, ETAG};
-use actix_web::{get, web, HttpResponse, Responder};
-use log::{info, warn};
+use actix_web::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+use actix_web::{get, web, HttpRequest, HttpResponse, Responder};
+use bytes::Bytes;
+use log::{debug, warn};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
+use crate::cache::Asset;
 use crate::AppState;
-
-/// asset contents and ETag, keyed by the requested filename
-pub type AssetCache = Arc<RwLock<HashMap<String, (Vec<u8>, String)>>>;
 
 /// resolves `requested` to a file inside `root`, or `None` if it is missing
 /// or would escape the root. `requested` arrives percent-decoded, so
@@ -35,7 +32,7 @@ async fn resolve_asset(root: &Path, requested: &str) -> Option<PathBuf> {
 pub async fn serve_asset(
     path: web::Path<String>,
     state: web::Data<AppState>,
-    req: actix_web::HttpRequest,
+    req: HttpRequest,
 ) -> impl Responder {
     let filename = path.into_inner();
 
@@ -44,84 +41,60 @@ pub async fn serve_asset(
         return HttpResponse::NotFound().body("not found");
     };
 
-    let cache = state.cache.clone();
-
-    // scoped read lock
-    let cached_content = {
-        let cache_read = cache.read().await;
-        cache_read.get(&filename).cloned()
-    };
-
-    if let Some((content, etag)) = cached_content {
-        // if the client sent an `if-none-match` header, check if it matches our etag.
-        if let Some(if_none_match_hv) = req.headers().get("If-None-Match") {
-            if let Ok(if_none_match_str) = if_none_match_hv.to_str() {
-                if if_none_match_str == etag {
-                    let mut stats = state.cache_stats.lock().unwrap();
-                    stats.hits += 1;
-                    return HttpResponse::NotModified().finish();
-                }
-            }
-        }
-
-        // cache hit but client needs content
-        let mut stats = state.cache_stats.lock().unwrap();
-        stats.hits += 1;
-
-        // respond with cached content and appropriate headers.
-        return HttpResponse::Ok()
-            .append_header((ETAG, etag.clone()))
-            .append_header((CACHE_CONTROL, "public, max-age=86400"))
-            .append_header(("X-Shadowstep-Cache", "HIT"))
-            // add debug print
-            .append_header(("X-Debug", "Cache header was added HIT"))
-            .content_type(
-                mime_guess::from_path(&filename)
-                    .first_or_octet_stream()
-                    .as_ref(),
-            )
-            .body(content.clone());
-    }
-
-    // if not in cache, read from the filesystem.
-    // debug print
-    println!("Looking for file at: {:?}", path);
-
-    match tokio::fs::read(&path).await {
-        Ok(content) => {
-            // generate an etag using a sha256 hash of the content.
-            let mut hasher = Sha256::new();
-            hasher.update(&content);
-            let etag = format!("\"{}\"", &hex::encode(hasher.finalize())[..32]);
-
-            // store the new asset in the cache.
-            let mut cache_write = cache.write().await;
-            cache_write.insert(filename.clone(), (content.clone(), etag.clone()));
-
-            let mut stats = state.cache_stats.lock().unwrap();
-            stats.misses += 1;
-            stats.items = cache_write.len();
-            drop(cache_write);
-
-            info!("Cache miss for: {}", filename);
-
-            HttpResponse::Ok()
-                .append_header((ETAG, etag))
-                .append_header((CACHE_CONTROL, "public, max-age=86400"))
-                .append_header(("X-Shadowstep-Cache", "MISS"))
-                .append_header(("X-Debug", "Cache header was added MISS"))
-                .content_type(
-                    mime_guess::from_path(&filename)
-                        .first_or_octet_stream()
-                        .as_ref(),
-                )
-                .body(content)
-        }
+    let (asset, status) = match load(&state, path).await {
+        Ok(loaded) => loaded,
         Err(e) => {
             warn!("Asset not found: {} - Error: {}", filename, e);
-            HttpResponse::NotFound().body("not found")
+            return HttpResponse::NotFound().body("not found");
+        }
+    };
+
+    let not_modified = req
+        .headers()
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == asset.etag);
+    if not_modified {
+        return HttpResponse::NotModified()
+            .append_header((ETAG, asset.etag.clone()))
+            .append_header(("X-Shadowstep-Cache", status))
+            .finish();
+    }
+
+    HttpResponse::Ok()
+        .append_header((ETAG, asset.etag.clone()))
+        .append_header((CACHE_CONTROL, "public, max-age=86400"))
+        .append_header(("X-Shadowstep-Cache", status))
+        .content_type(
+            mime_guess::from_path(&filename)
+                .first_or_octet_stream()
+                .as_ref(),
+        )
+        .body(asset.content.clone())
+}
+
+/// the asset at `path` and whether it came from the cache. a stored copy
+/// counts only while the file's length and modified time are unchanged, so
+/// an edited file is read again.
+async fn load(state: &AppState, path: PathBuf) -> std::io::Result<(Arc<Asset>, &'static str)> {
+    let metadata = tokio::fs::metadata(&path).await?;
+    let modified = metadata.modified()?;
+
+    if let Some(asset) = state.cache.asset(&path) {
+        if asset.modified == modified && asset.len == metadata.len() {
+            state.cache_stats.hit();
+            return Ok((asset, "HIT"));
         }
     }
+
+    debug!("Reading asset from {:?}", path);
+    let content = Bytes::from(tokio::fs::read(&path).await?);
+    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&content))[..32]);
+    state.cache_stats.miss();
+    Ok((
+        state.cache.insert_asset(path, content, etag, modified),
+        "MISS",
+    ))
 }
 
 #[cfg(test)]
