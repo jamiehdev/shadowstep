@@ -66,17 +66,46 @@ For each request:
 - A request with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` is forwarded with that header, but is neither served from the cache nor stored, because the origin may treat it as another method.
 - A request with an unsafe method, such as `POST`, `PUT` or `DELETE`, that gets a 2xx or 3xx response removes the stored response for its URL.
 
-Responses served from the cache carry `Age`. Proxied and asset responses carry `X-Shadowstep-Cache: HIT` or `MISS`.
+Responses served from the cache carry `Age`. Proxied and asset responses carry `X-Shadowstep-Cache`:
 
-`--cache-ttl-seconds` (default 300) caps how long any entry is kept, whatever the origin's freshness lifetime. `--cache-size-mb` (default 100) bounds origin responses and assets together, measured in bytes. The largest single entry is 8 MiB or the cache size, whichever is smaller. Larger bodies stream to the client without being stored. Setting either option to 0 turns caching off.
+- `HIT`: a fresh stored response.
+- `MISS`: the origin's response.
+- `REVALIDATED`: the origin answered a conditional request with `304 Not Modified`, and the client got the stored body with the 304's header fields.
+- `STALE`: a stale stored response, served under `stale-while-revalidate` or `stale-if-error`.
+
+`--cache-ttl-seconds` (default 300) caps the freshness lifetime of any entry, whatever the origin sent. `--cache-size-mb` (default 100) bounds origin responses and assets together, measured in bytes. The largest single entry is 8 MiB or the cache size, whichever is smaller. Larger bodies stream to the client without being stored. Setting either option to 0 turns caching off.
+
+### Revalidation and stale responses
+
+A stored response that is stale stays in the cache for a grace period so that it can be revalidated or served stale. The grace period is `--cache-ttl-seconds` if the response has an `ETag` or `Last-Modified`, and otherwise the larger of its `stale-while-revalidate` and `stale-if-error` windows, capped at `--cache-ttl-seconds`. Those windows do not count for a response that must be revalidated, as described below. A response with neither a validator nor a stale window is dropped when it goes stale. Entries in their grace period count towards `--cache-size-mb`.
+
+A `GET` that finds a stale response sends the origin `If-None-Match` from the stored `ETag` and `If-Modified-Since` from the stored `Last-Modified`. A request whose `Cache-Control: max-age` is shorter than a fresh stored response's age revalidates that response the same way.
+
+- On `304 Not Modified`, the 304's header fields replace the stored fields of the same name, the freshness lifetime starts again from the updated fields, and the client gets `200` with the stored body.
+- On any other response, the proxy forwards it and stores it under the usual rules.
+- If the client sent its own `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since` or `If-Range`, the proxy forwards those unchanged and adds none of its own. The origin's answer, including a `304`, goes to the client as `MISS`, and a 304 leaves the stored response as it was.
+
+`Cache-Control: stale-while-revalidate=N` lets the proxy serve a response for `N` seconds after it goes stale while it revalidates in the background. At most one background revalidation runs for each stored response at a time. It uses the same header fields, forwarding headers and `--upstream-timeout-seconds` as any request to the origin, with the stored validators in place of the client's conditional headers.
+
+`Cache-Control: stale-if-error=N` lets the proxy serve a response for `N` seconds after it goes stale when the origin answers 500, 502, 503 or 504, refuses the connection or times out.
+
+A response with `must-revalidate`, `proxy-revalidate` or `s-maxage` is never served stale, whatever its stale windows. If the origin cannot be reached to revalidate it, the client gets `504 Gateway Timeout`. A request with `Cache-Control: max-age` never gets a stale response. `HEAD` requests are answered only from fresh responses.
 
 Assets share the same cache. A stored asset is read from disk again when the file's size or modified time changes.
 
-`/health` counts hits and misses for proxied requests and assets together. `items` and `bytes` describe the whole cache.
+`/health` counts responses for proxied requests and assets together. Each response counts once:
+
+- `hits`: fresh stored responses.
+- `misses`: responses from the origin, including errors.
+- `revalidations`: 304s that freshened a stored response, in the foreground or the background.
+- `stale`: stale responses served under `stale-while-revalidate` or `stale-if-error`.
+
+`background_refreshes` counts background revalidations started. `hit_ratio` is the share of responses whose body came from the cache: hits, revalidations and stale responses. `items` and `bytes` describe the whole cache.
 
 Known limits:
 
-- There is no revalidation. shadowstep never sends conditional requests to the origin, so a stale entry is dropped and fetched again in full.
+- A response with `Cache-Control: no-cache` is not stored, although RFC 9111 allows storing it and revalidating it on every use.
+- A stored response is never used to answer a client's conditional request with a 304. A fresh hit always gets the full response.
 - There is no request coalescing. Concurrent misses for the same URL all go to the origin.
 - The host is part of the key, so a client that sends many different `Host` values can create many entries. The byte bound on the cache still applies.
 - Each process has its own cache. Replicas do not share entries or invalidations.
@@ -137,7 +166,7 @@ Each option can be set with a flag or an environment variable. The flag wins if 
 | `--origin-url` | `ORIGIN_URL` | required | Upstream origin URL, for example `http://origin.internal:3000` |
 | `--listen-addr` | `LISTEN_ADDR` | `0.0.0.0:8080` | Address for the plain HTTP listener |
 | `--asset-path` | `ASSET_PATH` | `/app/assets` | Directory served under `/assets/` |
-| `--cache-ttl-seconds` | `CACHE_TTL_SECONDS` | `300` | Longest time any cache entry is kept; 0 turns caching off |
+| `--cache-ttl-seconds` | `CACHE_TTL_SECONDS` | `300` | Longest freshness lifetime of any cache entry, and longest time a stale one is kept; 0 turns caching off |
 | `--cache-size-mb` | `CACHE_SIZE_MB` | `100` | Cache size in MiB for origin responses and assets together; 0 turns caching off |
 | `--tls-cert` | `TLS_CERT_PATH` | none | PEM certificate chain |
 | `--tls-key` | `TLS_KEY_PATH` | none | PEM private key in PKCS#8 form |
@@ -226,13 +255,14 @@ The Deployment runs two replicas, and each has its own cache. `X-Forwarded-For` 
 cargo test
 ```
 
-Unit tests in `src/assets.rs` cover asset path traversal, `src/cache.rs` covers `Cache-Control` parsing, and `src/forwarded.rs` covers reading the client's address, scheme and host from the connection. The integration tests in `tests/integration/` build one test crate and run the app against a [wiremock](https://crates.io/crates/wiremock) origin or a local TCP origin:
+Unit tests in `src/assets.rs` cover asset path traversal, `src/cache.rs` covers `Cache-Control` parsing and header updates from a 304, and `src/forwarded.rs` covers reading the client's address, scheme and host from the connection. The integration tests in `tests/integration/` build one test crate and run the app against a [wiremock](https://crates.io/crates/wiremock) origin or a local TCP origin:
 
 - `smoke.rs`: `/health`, proxying, upstream paths and the 502 path
 - `proxy.rs`: request and response bodies, the upstream timeout, hop-by-hop and URL override headers
 - `tls.rs`: the HTTPS listener and `--tls-listen-addr`
 - `forwarded.rs`: removal and replacement of forwarding headers
 - `cache.rs`: origin response caching
+- `revalidation.rs`: conditional requests, `stale-while-revalidate`, `stale-if-error` and `must-revalidate`
 
 CI also runs:
 
