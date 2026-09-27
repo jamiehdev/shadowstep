@@ -2,6 +2,7 @@ use actix_web::{web, Error, FromRequest, HttpRequest, HttpResponse};
 use hyper::{body::Body, header, Request as HyperRequest, Uri};
 use log::{debug, error};
 use std::convert::TryFrom;
+use url::Position;
 
 use crate::AppState;
 
@@ -24,7 +25,11 @@ pub async fn forward_to_upstream(
     );
 
     let path_and_query = req.uri().path_and_query().map_or("", |pq| pq.as_str());
-    let target_url_str = format!("{}{}", state.upstream_base_url, path_and_query);
+    // `Url` prints a bare host as `http://host/`, so trim the base path's
+    // trailing slash before appending the request's own leading slash. slicing
+    // at `AfterPath` also drops any query or fragment on the origin URL.
+    let upstream_base = state.upstream_base_url[..Position::AfterPath].trim_end_matches('/');
+    let target_url_str = format!("{}{}", upstream_base, path_and_query);
 
     let target_uri = match Uri::try_from(&target_url_str) {
         Ok(uri) => uri,
