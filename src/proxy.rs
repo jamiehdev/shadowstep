@@ -1,15 +1,21 @@
 use actix_web::body::SizedStream;
 use actix_web::{web, HttpRequest, HttpResponse};
-use futures_util::StreamExt;
+use bytes::{Bytes, BytesMut};
+use futures_util::{Stream, StreamExt};
 use hyper::body::Body;
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::{Request as HyperRequest, Response as HyperResponse, Uri};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use url::Position;
 
+use crate::cache::{self, Fields, PrimaryKey, RequestPolicy, StoredResponse};
 use crate::forwarded::{ClientInfo, CLIENT_FORWARDING_HEADERS};
 use crate::AppState;
+
+const CACHE_STATUS: &str = "x-shadowstep-cache";
 
 pub async fn forward_to_upstream(
     req: HttpRequest,
@@ -26,6 +32,23 @@ pub async fn forward_to_upstream(
     );
 
     let path_and_query = req.uri().path_and_query().map_or("", |pq| pq.as_str());
+    let cache_key = {
+        let info = req.connection_info();
+        PrimaryKey::new(info.scheme(), info.host(), path_and_query)
+    };
+    let request_policy = RequestPolicy::new(req.method(), req.headers());
+    if request_policy.may_serve {
+        if let Some(stored) = state
+            .cache
+            .lookup(&cache_key, req.headers(), request_policy.max_age)
+        {
+            debug!("Cache hit for {} {}", req.method(), req.uri());
+            state.cache_stats.hit();
+            return stored_response(&stored);
+        }
+    }
+    state.cache_stats.miss();
+
     // `Url` prints a bare host as `http://host/`, so trim the base path's
     // trailing slash before appending the request's own leading slash. slicing
     // at `AfterPath` also drops any query or fragment on the origin URL.
@@ -105,7 +128,29 @@ pub async fn forward_to_upstream(
                 "Received response from upstream: {:?}",
                 upstream_response.status()
             );
-            client_response(upstream_response)
+            let status = upstream_response.status();
+            // a successful unsafe request may have changed the resource
+            // (RFC 9111 section 4.4)
+            if !req.method().is_safe() && (status.is_success() || status.is_redirection()) {
+                state.cache.invalidate(&cache_key);
+            }
+            let store = cache::storable(
+                req.method(),
+                &request_policy,
+                req.headers(),
+                status,
+                upstream_response.headers(),
+            )
+            .map(|(storable, vary)| {
+                let cache = state.cache.clone();
+                Storing {
+                    limit: state.cache.max_entry(),
+                    finish: Box::new(move |status, headers, body| {
+                        cache.insert_response(cache_key, vary, &storable, status, headers, body)
+                    }),
+                }
+            });
+            client_response(upstream_response, store)
         }
         Ok(Err(e)) => {
             error!("Error forwarding request to upstream {}: {}", target_uri, e);
@@ -156,20 +201,40 @@ async fn request_body(mut payload: web::Payload) -> Result<Body, actix_web::erro
     Ok(body)
 }
 
+/// how to store a cacheable response once its whole body has arrived.
+struct Storing {
+    /// the largest body to store
+    limit: u64,
+    finish: Box<dyn FnOnce(hyper::StatusCode, Fields, Bytes)>,
+}
+
+/// a body on its way into the cache.
+struct BodyCopy {
+    buffer: BytesMut,
+    limit: u64,
+    finish: Box<dyn FnOnce(Bytes)>,
+}
+
 /// turns the origin's response into the client's, streaming the body. the
-/// response carries the origin's length when it sent one.
-fn client_response(upstream: HyperResponse<Body>) -> HttpResponse {
+/// response carries the origin's length when it sent one. with `store`, a
+/// body no longer than its limit is also copied into the cache as it streams.
+fn client_response(upstream: HyperResponse<Body>, store: Option<Storing>) -> HttpResponse {
     let (parts, body) = upstream.into_parts();
     let mut builder = HttpResponse::build(parts.status);
 
     let options = connection_options(parts.headers.get_all(header::CONNECTION));
+    let mut stored_headers = Vec::new();
     for (name, value) in parts.headers.iter() {
         // actix writes Content-Length from the body size, so a copied header
         // would go stale when the Compress middleware re-encodes the body
-        if name != header::CONTENT_LENGTH && is_end_to_end(name, &options) {
+        if name != header::CONTENT_LENGTH && name != CACHE_STATUS && is_end_to_end(name, &options) {
             builder.append_header((name.clone(), value.clone()));
+            if name != header::AGE {
+                stored_headers.push((name.clone(), value.clone()));
+            }
         }
     }
+    builder.insert_header((CACHE_STATUS, "MISS"));
 
     let body = body.map(|chunk| {
         chunk.map_err(|e| {
@@ -184,9 +249,98 @@ fn client_response(upstream: HyperResponse<Body>) -> HttpResponse {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
+    let status = parts.status;
+    let copy = store
+        .filter(|store| length.is_none_or(|length| length <= store.limit))
+        .map(|store| BodyCopy {
+            buffer: BytesMut::new(),
+            limit: store.limit,
+            finish: Box::new(move |body| (store.finish)(status, stored_headers, body)),
+        });
+    let body = Tee::new(body, length, copy);
+
     match length {
         Some(length) => builder.body(SizedStream::new(length, body)),
         None => builder.streaming(body),
+    }
+}
+
+/// the client's response from a stored one (RFC 9111 section 4). actix
+/// leaves the body out when it answers a HEAD request.
+fn stored_response(stored: &StoredResponse) -> HttpResponse {
+    let mut builder = HttpResponse::build(stored.status);
+    for (name, value) in &stored.headers {
+        builder.append_header((name.clone(), value.clone()));
+    }
+    builder
+        .insert_header((header::AGE, stored.age().as_secs().to_string()))
+        .insert_header((CACHE_STATUS, "HIT"))
+        .body(stored.body.clone())
+}
+
+/// passes a body stream through while copying it into a buffer. once the
+/// body has ended within the limit, the buffer goes to the finish callback.
+/// a body that passes the limit or fails is not kept.
+struct Tee<S> {
+    inner: S,
+    length: Option<u64>,
+    copy: Option<BodyCopy>,
+}
+
+impl<S> Tee<S> {
+    fn new(inner: S, length: Option<u64>, copy: Option<BodyCopy>) -> Self {
+        let mut tee = Tee {
+            inner,
+            length,
+            copy,
+        };
+        // actix never polls a sized body of length 0
+        if length == Some(0) {
+            tee.finish();
+        }
+        tee
+    }
+
+    fn finish(&mut self) {
+        if let Some(copy) = self.copy.take() {
+            if self
+                .length
+                .is_none_or(|length| length == copy.buffer.len() as u64)
+            {
+                (copy.finish)(copy.buffer.freeze());
+            }
+        }
+    }
+}
+
+impl<S> Stream for Tee<S>
+where
+    S: Stream<Item = Result<Bytes, hyper::Error>> + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let item = std::task::ready!(this.inner.poll_next_unpin(cx));
+        match &item {
+            Some(Ok(chunk)) => {
+                if let Some(BodyCopy { buffer, limit, .. }) = &mut this.copy {
+                    if (buffer.len() + chunk.len()) as u64 > *limit {
+                        debug!("Response body passed the cache entry limit");
+                        this.copy = None;
+                    } else {
+                        buffer.extend_from_slice(chunk);
+                        // actix stops polling a sized body at its length
+                        if this.length == Some(buffer.len() as u64) {
+                            this.finish();
+                        }
+                    }
+                }
+            }
+            Some(Err(_)) => this.copy = None,
+            None => this.finish(),
+        }
+        Poll::Ready(item)
     }
 }
 
