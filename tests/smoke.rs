@@ -2,7 +2,7 @@ mod common;
 
 use actix_web::http::StatusCode;
 use actix_web::test;
-use wiremock::matchers::{method, path_regex};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[actix_web::test]
@@ -19,9 +19,8 @@ async fn health_returns_ok() {
 #[actix_web::test]
 async fn proxies_get_to_origin() {
     let origin = MockServer::start().await;
-    // the upstream path is matched loosely: see the report on the doubled slash
     Mock::given(method("GET"))
-        .and(path_regex(r"^/+greeting$"))
+        .and(path("/greeting"))
         .respond_with(
             ResponseTemplate::new(201)
                 .insert_header("x-origin-header", "from-origin")
@@ -48,7 +47,7 @@ async fn proxies_get_to_origin() {
 async fn origin_not_found_passes_through() {
     let origin = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path_regex(r"^/+missing$"))
+        .and(path("/missing"))
         .respond_with(ResponseTemplate::new(404).set_body_string("origin says no"))
         .expect(1)
         .mount(&origin)
@@ -76,7 +75,7 @@ async fn unreachable_origin_is_bad_gateway() {
 async fn serves_over_a_real_socket() {
     let origin = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path_regex(r"^/+over-socket$"))
+        .and(path("/over-socket"))
         .respond_with(ResponseTemplate::new(200).set_body_string("via socket"))
         .expect(1)
         .mount(&origin)
@@ -101,4 +100,70 @@ async fn serves_over_a_real_socket() {
     // pool holds one
     drop(client);
     server.stop().await;
+}
+
+/// sends `GET request_path` through the proxy to an origin configured as
+/// `origin.uri() + origin_suffix` and returns the path and query the origin
+/// received.
+async fn upstream_target(origin_suffix: &str, request_path: &str) -> (String, Option<String>) {
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&origin)
+        .await;
+    let origin_url = format!("{}{}", origin.uri(), origin_suffix);
+    let (app, _assets) = common::service(&origin_url).await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get().uri(request_path).to_request(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = origin.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let url = &received[0].url;
+    (url.path().to_owned(), url.query().map(str::to_owned))
+}
+
+#[actix_web::test]
+async fn origin_receives_the_request_path_exactly() {
+    assert_eq!(
+        upstream_target("", "/greeting").await,
+        ("/greeting".to_owned(), None)
+    );
+}
+
+#[actix_web::test]
+async fn origin_with_trailing_slash_receives_the_request_path_exactly() {
+    assert_eq!(
+        upstream_target("/", "/greeting").await,
+        ("/greeting".to_owned(), None)
+    );
+}
+
+#[actix_web::test]
+async fn query_string_is_preserved() {
+    assert_eq!(
+        upstream_target("", "/search?q=a&b=2").await,
+        ("/search".to_owned(), Some("q=a&b=2".to_owned()))
+    );
+}
+
+#[actix_web::test]
+async fn origin_path_prefix_is_kept() {
+    assert_eq!(
+        upstream_target("/api", "/users?page=2").await,
+        ("/api/users".to_owned(), Some("page=2".to_owned()))
+    );
+}
+
+#[actix_web::test]
+async fn origin_path_prefix_with_trailing_slash_is_kept() {
+    assert_eq!(
+        upstream_target("/api/", "/users").await,
+        ("/api/users".to_owned(), None)
+    );
 }
