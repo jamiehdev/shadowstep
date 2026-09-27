@@ -3,5 +3,7 @@
 .env
 assets/*
 !assets/.gitkeep
-certs/*
-!certs/.gitkeep
+# TLS keys and certificates are mounted at run time and never committed
+certs/
+*.pem
+*.key

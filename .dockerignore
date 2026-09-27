@@ -1,0 +1,7 @@
+# keep TLS keys and local build output out of the build context
+certs/
+*.pem
+*.key
+.env
+.git
+target/
