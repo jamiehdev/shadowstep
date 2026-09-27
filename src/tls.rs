@@ -1,9 +1,12 @@
-use rustls::{Certificate, PrivateKey, ServerConfig};
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls::crypto::ring;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::config::Config;
 
@@ -28,30 +31,27 @@ pub fn bind_listeners(
 /// loads a rustls server config from a PEM certificate chain and a PKCS#8
 /// private key. only the first key in the key file is used.
 pub fn load_rustls_config(cert_path: &Path, key_path: &Path) -> io::Result<ServerConfig> {
-    let cert_file = &mut BufReader::new(File::open(cert_path)?);
-    let key_file = &mut BufReader::new(File::open(key_path)?);
+    let cert_chain = CertificateDer::pem_reader_iter(BufReader::new(File::open(cert_path)?))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid_input("invalid cert"))?;
 
-    let cert_chain = certs(cert_file)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))?
-        .into_iter()
-        .map(Certificate)
-        .collect();
+    let key =
+        match PrivatePkcs8KeyDer::pem_reader_iter(BufReader::new(File::open(key_path)?)).next() {
+            Some(Ok(key)) => PrivateKeyDer::from(key),
+            Some(Err(_)) => return Err(invalid_input("invalid key")),
+            None => return Err(invalid_input("No private keys found")),
+        };
 
-    let mut keys = pkcs8_private_keys(key_file)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))?
-        .into_iter()
-        .map(PrivateKey)
-        .collect::<Vec<_>>();
-
-    if keys.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "No private keys found",
-        ));
-    }
-    ServerConfig::builder()
-        .with_safe_defaults()
+    // an explicit provider, because rustls panics in `ServerConfig::builder`
+    // when the build enables more than one crypto provider feature
+    ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| invalid_input(e.to_string()))?
         .with_no_client_auth()
-        .with_single_cert(cert_chain, keys.remove(0))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| invalid_input(e.to_string()))
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

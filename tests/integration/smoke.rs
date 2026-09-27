@@ -2,6 +2,8 @@ use crate::common;
 
 use actix_web::http::StatusCode;
 use actix_web::test;
+use bytes::Bytes;
+use http_body_util::Empty;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -81,7 +83,7 @@ async fn serves_over_a_real_socket() {
         .mount(&origin)
         .await;
     let server = common::spawn(&origin.uri());
-    let client = hyper::Client::new();
+    let client = common::client::<Empty<Bytes>>();
 
     let health = client
         .get(server.url("/health").parse().unwrap())
@@ -92,9 +94,9 @@ async fn serves_over_a_real_socket() {
         .await
         .unwrap();
 
-    assert_eq!(health.status(), StatusCode::OK);
-    assert_eq!(proxied.status(), StatusCode::OK);
-    let body = hyper::body::to_bytes(proxied.into_body()).await.unwrap();
+    assert_eq!(health.status(), hyper::StatusCode::OK);
+    assert_eq!(proxied.status(), hyper::StatusCode::OK);
+    let body = common::body_bytes(proxied.into_body()).await;
     assert_eq!(body.as_ref(), b"via socket");
     // a graceful stop waits for open keep-alive connections, and the client
     // pool holds one

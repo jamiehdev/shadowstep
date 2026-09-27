@@ -1,14 +1,19 @@
 use actix_web::body::SizedStream;
+use actix_web::error::PayloadError;
+use actix_web::http::header::{self, HeaderMap, HeaderName, HeaderValue};
+use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
-use hyper::body::Body;
-use hyper::header::{self, HeaderName, HeaderValue};
-use hyper::{Request as HyperRequest, Response as HyperResponse, Uri};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::{Request as HyperRequest, Uri};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 use url::{Position, Url};
 
 use crate::cache::{self, Fields, PrimaryKey, RequestPolicy, StoredResponse};
@@ -16,6 +21,11 @@ use crate::forwarded::{ClientInfo, CLIENT_FORWARDING_HEADERS, URL_OVERRIDE_HEADE
 use crate::AppState;
 
 const CACHE_STATUS: &str = "x-shadowstep-cache";
+
+type BodyError = Box<dyn std::error::Error + Send + Sync>;
+
+/// the body of a request to the origin.
+pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, BodyError>;
 
 pub async fn forward_to_upstream(
     req: HttpRequest,
@@ -72,8 +82,10 @@ pub async fn forward_to_upstream(
                 "Received response from upstream: {:?}",
                 upstream_response.status()
             );
-            let store = store_plan(&req, &state, cache_key, &request_policy, &upstream_response);
-            client_response(upstream_response, store)
+            let (parts, body) = upstream_response.into_parts();
+            let head = Head::from_upstream(&parts);
+            let store = store_plan(&req, &state, cache_key, &request_policy, &head);
+            client_response(head, body, store)
         }
         Ok(Err(e)) => {
             error!("Error forwarding request to upstream {}: {}", target_uri, e);
@@ -128,8 +140,10 @@ fn upstream_request(
 
     debug!("Forwarding request to: {}", target_uri);
 
+    // actix-web 4 uses `http` 0.2 and hyper 1 uses `http` 1, so the method
+    // and fields cross as strings and bytes
     let mut builder = HyperRequest::builder()
-        .method(req.method().clone())
+        .method(req.method().as_str())
         .uri(target_uri.clone());
 
     let options = connection_options(req.headers().get_all(header::CONNECTION));
@@ -140,12 +154,12 @@ fn upstream_request(
             && !URL_OVERRIDE_HEADERS.contains(name)
             && is_end_to_end(name, &options)
         {
-            builder = builder.header(name.clone(), value.clone());
+            builder = builder.header(name.as_str(), value.as_bytes());
         }
     }
 
     if let Some(host) = upstream_host(&state.upstream_base_url) {
-        builder = builder.header(header::HOST, host);
+        builder = builder.header(hyper::header::HOST, host);
     }
     if let Some(ip) = client.ip {
         builder = builder.header("X-Forwarded-For", ip.to_string());
@@ -175,18 +189,13 @@ fn store_plan(
     state: &AppState,
     cache_key: PrimaryKey,
     request_policy: &RequestPolicy,
-    upstream_response: &HyperResponse<Body>,
+    head: &Head,
 ) -> Option<Storing> {
-    let status = upstream_response.status();
+    let status = head.status;
     if !req.method().is_safe() && (status.is_success() || status.is_redirection()) {
         state.cache.invalidate(&cache_key);
     }
-    let (storable, vary) = cache::storable(
-        request_policy,
-        req.headers(),
-        status,
-        upstream_response.headers(),
-    )?;
+    let (storable, vary) = cache::storable(request_policy, req.headers(), status, &head.map)?;
     let cache = state.cache.clone();
     Some(Storing {
         limit: state.cache.max_entry(),
@@ -198,44 +207,87 @@ fn store_plan(
 
 /// the request body for the origin. actix's `Payload` is `!Send` and hyper
 /// needs a `Send` body, so a task on this worker's local executor copies the
-/// payload into a hyper body channel as chunks arrive.
-async fn request_body(mut payload: web::Payload) -> Result<Body, actix_web::error::PayloadError> {
-    // an empty body stays `Body::empty()` so that hyper does not send
+/// payload into a channel that the body reads, as chunks arrive.
+async fn request_body(mut payload: web::Payload) -> Result<UpstreamBody, PayloadError> {
+    // an empty body stays empty so that hyper does not send
     // `Transfer-Encoding: chunked` on a GET
     let first = match payload.next().await {
-        None => return Ok(Body::empty()),
+        None => return Ok(Empty::new().map_err(|never| match never {}).boxed_unsync()),
         Some(chunk) => chunk?,
     };
 
-    let (mut sender, body) = Body::channel();
-    actix_web::rt::spawn(async move {
-        if sender.send_data(first).await.is_err() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    actix_web::rt::spawn(pump_request_body(first, payload, sender));
+    let frames = futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx));
+    Ok(StreamBody::new(frames).boxed_unsync())
+}
+
+/// sends `first` and the rest of `payload` to the origin request body. a
+/// payload error goes to the body too, so that hyper fails the request
+/// rather than end a truncated body.
+async fn pump_request_body(
+    first: Bytes,
+    mut payload: web::Payload,
+    sender: mpsc::Sender<Result<Frame<Bytes>, BodyError>>,
+) {
+    if sender.send(Ok(Frame::data(first))).await.is_err() {
+        return;
+    }
+    while let Some(chunk) = payload.next().await {
+        let frame = chunk.map(Frame::data).map_err(|e| {
+            warn!("Failed to read request body: {}", e);
+            BodyError::from(e)
+        });
+        let failed = frame.is_err();
+        // a closed channel means the origin request has ended, so the rest
+        // is unwanted
+        if sender.send(frame).await.is_err() || failed {
             return;
         }
-        while let Some(chunk) = payload.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    // the origin request has ended, so the rest is unwanted
-                    if sender.send_data(chunk).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to read request body: {}", e);
-                    sender.abort();
-                    return;
-                }
-            }
+    }
+}
+
+/// the origin response's status and fields as actix types.
+struct Head {
+    status: StatusCode,
+    /// the fields in the order the origin sent them
+    fields: Fields,
+    map: HeaderMap,
+}
+
+impl Head {
+    fn from_upstream(parts: &hyper::http::response::Parts) -> Self {
+        // both `http` versions accept the status codes 100 to 999
+        let status = StatusCode::from_u16(parts.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        // both `http` versions validate names and values by the same rules,
+        // so no field is dropped here
+        let fields: Fields = parts
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    HeaderName::from_bytes(name.as_str().as_bytes()).ok()?,
+                    HeaderValue::from_bytes(value.as_bytes()).ok()?,
+                ))
+            })
+            .collect();
+        let mut map = HeaderMap::with_capacity(fields.len());
+        for (name, value) in &fields {
+            map.append(name.clone(), value.clone());
         }
-    });
-    Ok(body)
+        Head {
+            status,
+            fields,
+            map,
+        }
+    }
 }
 
 /// how to store a cacheable response once its whole body has arrived.
 struct Storing {
     /// the largest body to store
     limit: u64,
-    finish: Box<dyn FnOnce(hyper::StatusCode, Fields, Bytes)>,
+    finish: Box<dyn FnOnce(StatusCode, Fields, Bytes)>,
 }
 
 /// a body on its way into the cache.
@@ -248,13 +300,12 @@ struct BodyCopy {
 /// turns the origin's response into the client's, streaming the body. the
 /// response carries the origin's length when it sent one. with `store`, a
 /// body no longer than its limit is also copied into the cache as it streams.
-fn client_response(upstream: HyperResponse<Body>, store: Option<Storing>) -> HttpResponse {
-    let (parts, body) = upstream.into_parts();
-    let mut builder = HttpResponse::build(parts.status);
+fn client_response(head: Head, body: Incoming, store: Option<Storing>) -> HttpResponse {
+    let mut builder = HttpResponse::build(head.status);
 
-    let options = connection_options(parts.headers.get_all(header::CONNECTION));
+    let options = connection_options(head.map.get_all(header::CONNECTION));
     let mut stored_headers = Vec::new();
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &head.fields {
         // actix writes Content-Length from the body size, so a copied header
         // would go stale when the Compress middleware re-encodes the body
         if name != header::CONTENT_LENGTH && name != CACHE_STATUS && is_end_to_end(name, &options) {
@@ -266,20 +317,21 @@ fn client_response(upstream: HyperResponse<Body>, store: Option<Storing>) -> Htt
     }
     builder.insert_header((CACHE_STATUS, "MISS"));
 
-    let body = body.map(|chunk| {
+    // the data stream drops trailer frames
+    let body = body.into_data_stream().map(|chunk| {
         chunk.map_err(|e| {
             error!("Error reading upstream response body: {}", e);
             e
         })
     });
 
-    let length = parts
-        .headers
+    let length = head
+        .map
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    let status = parts.status;
+    let status = head.status;
     let copy = store
         .filter(|store| length.is_none_or(|length| length <= store.limit))
         .map(|store| BodyCopy {

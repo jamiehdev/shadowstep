@@ -7,16 +7,17 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = { version = "4", features = ["rustls"] }
+actix-web = { version = "4.9", features = ["rustls-0_23"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 env_logger = "0.11"
 log = "0.4"
-hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp", "stream"] } # to reduce features, or note that they have been.
-hyper-rustls = { version = "0.24", features = ["http2"] } # for hyper client https support
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12"] }
 url = "2.5.4" # for url parsing and manipulation
-rustls = "0.20.9" # for server-side tls
-rustls-pemfile = "1.0.0" # for loading certs/keys
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 sha2 = "0.10.8"
 serde_json = "1.0.140"
 mime_guess = "2.0.4"
@@ -36,5 +37,5 @@ strip = true
 actix-http = "3"
 tempfile = "3.27.0"
 wiremock = "0.6.5"
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
-tokio-rustls = "0.23"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }

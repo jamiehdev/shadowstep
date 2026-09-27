@@ -1,10 +1,9 @@
 //! a shared HTTP cache (RFC 9111) for origin responses, and the byte-bounded
 //! store that also holds local assets.
 
-use actix_web::http::header::{HeaderMap as RequestHeaders, AUTHORIZATION, COOKIE};
+use actix_web::http::header::{self, HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, COOKIE};
+use actix_web::http::{Method, StatusCode};
 use bytes::Bytes;
-use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
-use hyper::{Method, StatusCode};
 use moka::sync::Cache;
 use moka::Expiry;
 use std::path::{Path, PathBuf};
@@ -240,7 +239,7 @@ impl Store {
     pub fn lookup(
         &self,
         primary: &PrimaryKey,
-        request: &RequestHeaders,
+        request: &HeaderMap,
         max_age: Option<Duration>,
     ) -> Option<Arc<StoredResponse>> {
         let index = self.index.get(primary)?;
@@ -319,7 +318,7 @@ pub struct Vary {
     values: Vec<Option<String>>,
 }
 
-fn vary_values(names: &[HeaderName], request: &RequestHeaders) -> Vec<Option<String>> {
+fn vary_values(names: &[HeaderName], request: &HeaderMap) -> Vec<Option<String>> {
     names
         .iter()
         .map(|name| {
@@ -430,7 +429,7 @@ pub struct RequestPolicy {
 }
 
 impl RequestPolicy {
-    pub fn new(method: &Method, headers: &RequestHeaders) -> Self {
+    pub fn new(method: &Method, headers: &HeaderMap) -> Self {
         let directives = Directives::parse(headers.get_all(header::CACHE_CONTROL));
         // a shared cache that stores GET responses can answer HEAD from them
         // (RFC 9110 section 9.3.2). request no-cache means the client wants
@@ -470,7 +469,7 @@ const UNSTORABLE_DIRECTIVES: [&str; 3] = ["no-store", "private", "no-cache"];
 /// (RFC 9111 section 3), and the request's `Vary` values for its key.
 pub fn storable(
     request_policy: &RequestPolicy,
-    request: &RequestHeaders,
+    request: &HeaderMap,
     status: StatusCode,
     response: &HeaderMap,
 ) -> Option<(Storable, Vary)> {

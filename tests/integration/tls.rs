@@ -1,6 +1,8 @@
 use crate::common;
 
+use bytes::Bytes;
 use clap::Parser;
+use http_body_util::Empty;
 use shadowstep::config::Config;
 use shadowstep::run;
 use shadowstep::tls::bind_listeners;
@@ -9,7 +11,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -17,11 +20,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// a self-signed certificate for `localhost`, written as PEM files into a
 /// temporary directory. returns the directory and the certificate DER.
 fn self_signed_cert() -> (TempDir, Vec<u8>) {
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("cert.pem"), cert.pem()).unwrap();
-    std::fs::write(dir.path().join("key.pem"), key_pair.serialize_pem()).unwrap();
+    std::fs::write(dir.path().join("key.pem"), signing_key.serialize_pem()).unwrap();
     (dir, cert.der().to_vec())
 }
 
@@ -58,9 +61,8 @@ fn spawn_tls(
 /// `cert_der` for `localhost`, and returns the whole response.
 async fn tls_exchange(addr: SocketAddr, cert_der: Vec<u8>, request: &[u8]) -> String {
     let mut roots = RootCertStore::empty();
-    roots.add(&Certificate(cert_der)).unwrap();
+    roots.add(CertificateDer::from(cert_der)).unwrap();
     let client_config = ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -160,19 +162,19 @@ async fn https_and_http_responses_are_cached_apart() {
     let request = b"GET /page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
     let first = tls_exchange(https_addr, cert_der.clone(), request).await;
-    let client = hyper::Client::new();
+    let client = common::client();
     // the same Host, so that only the scheme tells the two requests apart
     let plain = client
         .request(
             hyper::Request::get(format!("http://{http_addr}/page"))
                 .header("host", "localhost")
-                .body(hyper::Body::empty())
+                .body(Empty::<Bytes>::new())
                 .unwrap(),
         )
         .await
         .unwrap();
     let plain_status = plain.headers()["x-shadowstep-cache"].clone();
-    let plain_body = hyper::body::to_bytes(plain.into_body()).await.unwrap();
+    let plain_body = common::body_bytes(plain.into_body()).await;
     let second = tls_exchange(https_addr, cert_der, request).await;
 
     assert!(first.contains("x-shadowstep-cache: MISS"), "{first}");

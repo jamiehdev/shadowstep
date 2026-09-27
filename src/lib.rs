@@ -19,14 +19,16 @@ use actix_web::body::MessageBody;
 use actix_web::dev::{Server, ServiceFactory, ServiceRequest, ServiceResponse};
 use actix_web::middleware::{Compress, Logger};
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
-use hyper::client::HttpConnector;
-use hyper::Client;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use log::info;
 use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -54,7 +56,7 @@ impl CacheStats {
 pub struct AppState {
     cache_stats: CacheStats,
     cache: Store,
-    http_client: Client<HttpsConnector<HttpConnector>>,
+    http_client: Client<HttpsConnector<HttpConnector>, proxy::UpstreamBody>,
     upstream_base_url: Url,
     asset_path: PathBuf,
     upstream_timeout: Duration,
@@ -85,14 +87,16 @@ async fn health_check(state: web::Data<AppState>) -> impl Responder {
 pub fn build_state(config: &Config) -> io::Result<web::Data<AppState>> {
     std::fs::create_dir_all(&config.asset_path)?;
 
-    // HTTPS connector with native-trust roots for TLS
     let https = HttpsConnectorBuilder::new()
-        .with_native_roots()
+        .with_provider_and_native_roots(Arc::new(rustls::crypto::ring::default_provider()))?
         .https_or_http()
         .enable_http1()
         .build();
 
-    let http_client = Client::builder().build(https);
+    // the pool needs a timer to close connections after their idle timeout
+    let http_client = Client::builder(TokioExecutor::new())
+        .pool_timer(TokioTimer::new())
+        .build(https);
 
     let upstream_base_url = Url::parse(&config.origin_url).map_err(|e| {
         io::Error::new(
@@ -152,7 +156,7 @@ pub fn run(
         .listen(http)?;
 
     if let Some((listener, tls_config)) = tls {
-        server = server.listen_rustls(listener, tls_config)?;
+        server = server.listen_rustls_0_23(listener, tls_config)?;
     }
 
     Ok(server.run())
