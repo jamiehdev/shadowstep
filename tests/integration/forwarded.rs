@@ -106,18 +106,22 @@ async fn client_x_real_ip_and_other_forwarding_headers_are_dropped() {
 }
 
 #[actix_web::test]
-async fn client_prefix_uri_and_host_claims_are_dropped() {
+async fn client_prefix_uri_host_and_scheme_claims_are_dropped() {
     let cases = [
         ("x-forwarded-prefix", "/evil"),
         ("x-forwarded-uri", "/admin"),
         ("x-host", "evil.example"),
+        ("x-forwarded-scheme", "https"),
+        ("x-original-host", "evil.example"),
+        ("front-end-https", "on"),
     ];
+    let mut leaked = Vec::new();
     for (name, value) in cases {
         let (received, _) = forwarded_request(&[(name, value)]).await;
-
-        assert!(
-            received.headers.get(name).is_none(),
-            "{name} reached the origin"
-        );
+        if received.headers.get(name).is_some() {
+            leaked.push(name);
+        }
     }
+
+    assert!(leaked.is_empty(), "reached the origin: {leaked:?}");
 }
