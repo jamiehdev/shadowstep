@@ -1,6 +1,6 @@
 # shadowstep
 
-A small caching reverse proxy written in Rust (actix-web 4, hyper 1, rustls 0.23). It serves local files from an asset directory, forwards every other request to one upstream origin, and keeps cacheable origin responses in memory.
+An edge CDN node written in Rust (actix-web 4, hyper 1, rustls 0.23). It caches origin responses in memory under RFC 9111, terminates TLS and serves local files from an asset directory. Every other request goes to one upstream origin.
 
 ## What it does
 
