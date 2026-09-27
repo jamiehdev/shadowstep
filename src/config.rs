@@ -36,7 +36,9 @@ pub struct Config {
     pub tls_listen_addr: String,
 
     /// seconds to wait for the origin's response headers, including the time
-    /// to send the request body. the proxy answers 504 when it runs out.
+    /// to send the request body. the proxy answers 504 when it runs out. it
+    /// is also the longest the origin may send nothing during a response
+    /// body before the proxy closes the client's connection.
     #[clap(long, env = "UPSTREAM_TIMEOUT_SECONDS", default_value_t = 30)]
     pub upstream_timeout_seconds: u64,
 }

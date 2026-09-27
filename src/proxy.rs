@@ -11,9 +11,13 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Request as HyperRequest, Uri};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
+use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, Sleep};
 use url::{Position, Url};
 
 use crate::cache::{
@@ -100,7 +104,7 @@ pub async fn forward_to_upstream(
                 "Received response from upstream: {:?}",
                 upstream_response.status()
             );
-            exchange.answered(upstream_response)
+            exchange.answered(upstream_response, target_uri)
         }
         Ok(Err(e)) => {
             error!("Error forwarding request to upstream {}: {}", target_uri, e);
@@ -322,7 +326,9 @@ fn refresh_in_background(
             tokio::time::timeout(state.upstream_timeout, state.http_client.request(hyper_req))
                 .await;
         match upstream {
-            Ok(Ok(response)) => refresh(&req, &state, cache_key, &entry, response).await,
+            Ok(Ok(response)) => {
+                refresh(&req, &state, cache_key, &entry, response, target_uri).await
+            }
             Ok(Err(e)) => warn!("Background revalidation of {} failed: {}", target_uri, e),
             Err(_) => warn!("Background revalidation of {} timed out", target_uri),
         }
@@ -338,6 +344,7 @@ async fn refresh(
     cache_key: PrimaryKey,
     entry: &StaleEntry,
     response: hyper::Response<Incoming>,
+    target_uri: Uri,
 ) {
     let (parts, body) = response.into_parts();
     let head = Head::from_upstream(&parts);
@@ -357,6 +364,8 @@ async fn refresh(
         return;
     };
     let limit = usize::try_from(store.limit).unwrap_or(usize::MAX);
+    let body = origin_body(body, state.upstream_timeout, target_uri);
+    let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
     match Limited::new(body, limit).collect().await {
         Ok(collected) => (store.finish)(
             head.status,
@@ -393,7 +402,7 @@ struct Exchange {
 
 impl Exchange {
     /// the client's response once the origin has answered.
-    fn answered(self, response: hyper::Response<Incoming>) -> HttpResponse {
+    fn answered(self, response: hyper::Response<Incoming>, target_uri: Uri) -> HttpResponse {
         let (parts, body) = response.into_parts();
         let head = Head::from_upstream(&parts);
         if let Some(stale) = &self.stale {
@@ -413,6 +422,7 @@ impl Exchange {
             &self.request_policy,
             &head,
         );
+        let body = origin_body(body, self.state.upstream_timeout, target_uri);
         client_response(head, body, store.map(|store| store.holding(flight)))
     }
 
@@ -696,7 +706,10 @@ struct BodyCopy {
 /// turns the origin's response into the client's, streaming the body. the
 /// response carries the origin's length when it sent one. with `store`, a
 /// body no longer than its limit is also copied into the cache as it streams.
-fn client_response(head: Head, body: Incoming, store: Option<Storing>) -> HttpResponse {
+fn client_response<S>(head: Head, body: S, store: Option<Storing>) -> HttpResponse
+where
+    S: Stream<Item = io::Result<Bytes>> + Unpin + 'static,
+{
     let mut builder = HttpResponse::build(head.status);
 
     let fields = forwardable_fields(&head);
@@ -705,14 +718,6 @@ fn client_response(head: Head, body: Incoming, store: Option<Storing>) -> HttpRe
     }
     builder.insert_header((CACHE_STATUS, "MISS"));
     let stored_headers = stored_fields(fields);
-
-    // the data stream drops trailer frames
-    let body = body.into_data_stream().map(|chunk| {
-        chunk.map_err(|e| {
-            error!("Error reading upstream response body: {}", e);
-            e
-        })
-    });
 
     let length = head
         .map
@@ -770,6 +775,75 @@ fn cached_response(stored: &StoredResponse, cache_status: &'static str) -> HttpR
         .body(stored.body.clone())
 }
 
+/// the origin's response body as a stream of data chunks, which ends with an
+/// error once the origin has sent nothing for `idle`.
+fn origin_body(
+    body: Incoming,
+    idle: Duration,
+    target_uri: Uri,
+) -> IdleTimeout<impl Stream<Item = io::Result<Bytes>> + Unpin> {
+    // the data stream drops trailer frames
+    let body = body.into_data_stream().map(|chunk| {
+        chunk.map_err(|e| {
+            error!("Error reading upstream response body: {}", e);
+            io::Error::other(e)
+        })
+    });
+    IdleTimeout {
+        inner: body,
+        idle,
+        sleep: Box::pin(tokio::time::sleep(idle)),
+        waiting: false,
+        expired: false,
+        target_uri,
+    }
+}
+
+/// passes a body stream through, and ends it with an error when the next
+/// chunk takes longer than `idle` to arrive. the error makes actix close
+/// the client's connection before the body is whole, and makes the `Tee`
+/// drop its copy.
+struct IdleTimeout<S> {
+    inner: S,
+    idle: Duration,
+    sleep: Pin<Box<Sleep>>,
+    /// the deadline runs from the first poll after the last chunk, so time
+    /// spent waiting for a slow client does not count against the origin
+    waiting: bool,
+    expired: bool,
+    target_uri: Uri,
+}
+
+impl<S> Stream for IdleTimeout<S>
+where
+    S: Stream<Item = io::Result<Bytes>> + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.expired {
+            return Poll::Ready(None);
+        }
+        if !this.waiting {
+            this.sleep.as_mut().reset(Instant::now() + this.idle);
+            this.waiting = true;
+        }
+        if let Poll::Ready(item) = this.inner.poll_next_unpin(cx) {
+            this.waiting = false;
+            return Poll::Ready(item);
+        }
+        std::task::ready!(this.sleep.as_mut().poll(cx));
+        this.expired = true;
+        warn!(
+            "Upstream {} sent no response body data for {:?}",
+            this.target_uri, this.idle
+        );
+        let error = io::Error::new(io::ErrorKind::TimedOut, "origin response body went idle");
+        Poll::Ready(Some(Err(error)))
+    }
+}
+
 /// passes a body stream through while copying it into a buffer. once the
 /// body has ended within the limit, the buffer goes to the finish callback.
 /// a body that passes the limit or fails is not kept.
@@ -805,9 +879,9 @@ impl<S> Tee<S> {
     }
 }
 
-impl<S> Stream for Tee<S>
+impl<S, E> Stream for Tee<S>
 where
-    S: Stream<Item = Result<Bytes, hyper::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
     type Item = S::Item;
 
