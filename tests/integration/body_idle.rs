@@ -1,4 +1,4 @@
-use crate::common::{self, Running};
+use crate::common::{self, metric, parse_exposition, Running, Sample};
 
 use bytes::Bytes;
 use http_body_util::Empty;
@@ -197,6 +197,50 @@ async fn sized_body_that_stalls_closes_the_client_connection_short() {
     proxy.stop().await;
 }
 
+async fn scrape(proxy: &Running) -> Vec<Sample> {
+    let client = common::client::<Empty<Bytes>>();
+    let resp = timeout(PATIENCE, client.get(proxy.url("/metrics").parse().unwrap()))
+        .await
+        .expect("scrape timed out")
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = common::body_bytes(resp.into_body()).await;
+    parse_exposition(std::str::from_utf8(&body).unwrap())
+}
+
+fn body_idle_timeouts(samples: &[Sample], kind: &str) -> Option<f64> {
+    metric(
+        samples,
+        "shadowstep_origin_body_idle_timeouts_total",
+        &[("kind", kind)],
+    )
+}
+
+#[actix_web::test]
+async fn stalled_body_counts_one_idle_timeout_and_one_origin_response() {
+    let mut origin = scripted_origin(vec![stalled_sized()]).await;
+    let proxy = spawn(&origin);
+
+    raw_get(&proxy, "/page").await;
+    origin_connection_closed(&mut origin, 0).await;
+    let samples = scrape(&proxy).await;
+
+    assert_eq!(body_idle_timeouts(&samples, "foreground"), Some(1.0));
+    assert_eq!(body_idle_timeouts(&samples, "background"), Some(0.0));
+    // the idle timeout comes after the headers, so the origin request is
+    // still counted once, by its status
+    let origin_requests = |outcome| {
+        metric(
+            &samples,
+            "shadowstep_origin_requests_total",
+            &[("kind", "foreground"), ("outcome", outcome)],
+        )
+    };
+    assert_eq!(origin_requests("2xx"), Some(1.0));
+    assert_eq!(origin_requests("timeout"), Some(0.0));
+    proxy.stop().await;
+}
+
 #[actix_web::test]
 async fn chunked_body_that_stalls_gets_no_last_chunk() {
     let mut origin = scripted_origin(vec![stalled_chunked()]).await;
@@ -318,6 +362,9 @@ async fn background_revalidation_whose_body_stalls_is_given_up() {
         raw_get(&proxy, "/page").await;
     }
     assert_eq!(background_refreshes(&proxy).await, 2);
+    let samples = scrape(&proxy).await;
+    assert_eq!(body_idle_timeouts(&samples, "background"), Some(1.0));
+    assert_eq!(body_idle_timeouts(&samples, "foreground"), Some(0.0));
     assert!(
         started.elapsed() < IDLE + MARGIN,
         "took {:?}",
