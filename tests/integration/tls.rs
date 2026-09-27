@@ -31,7 +31,7 @@ fn self_signed_cert() -> (TempDir, Vec<u8>) {
 /// a proxy for `origin_url` listening on HTTP and HTTPS ports, both
 /// ephemeral. returns the HTTPS and HTTP addresses, the server handle, the
 /// certificate DER for the client to trust, and the directories to keep.
-fn spawn_tls(
+pub(crate) fn spawn_tls(
     origin_url: &str,
 ) -> (
     (SocketAddr, SocketAddr),
