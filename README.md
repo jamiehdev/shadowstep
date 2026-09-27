@@ -86,7 +86,7 @@ A `GET` that finds a stale response sends the origin `If-None-Match` from the st
 - On any other response, the proxy forwards it and stores it under the usual rules.
 - If the client sent its own `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since` or `If-Range`, the proxy forwards those unchanged and adds none of its own. The origin's answer, including a `304`, goes to the client as `MISS`, and a 304 leaves the stored response as it was.
 
-`Cache-Control: stale-while-revalidate=N` lets the proxy serve a response for `N` seconds after it goes stale while it revalidates in the background. At most one background revalidation runs for each stored response at a time. It uses the same header fields, forwarding headers and `--upstream-timeout-seconds` as any request to the origin, with the stored validators in place of the client's conditional headers.
+`Cache-Control: stale-while-revalidate=N` lets the proxy serve a response for `N` seconds after it goes stale while it revalidates in the background. At most one background revalidation runs for each stored response at a time. It uses the same header fields, forwarding headers and `--upstream-timeout-seconds` as any request to the origin, with the stored validators in place of the client's conditional headers. If the origin sends nothing for that long during the body of its answer, the proxy stores nothing, and a later request can start another background revalidation.
 
 `Cache-Control: stale-if-error=N` lets the proxy serve a response for `N` seconds after it goes stale when the origin answers 500, 502, 503 or 504, refuses the connection or times out.
 

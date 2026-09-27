@@ -260,3 +260,69 @@ async fn stalled_cacheable_body_is_not_stored() {
     assert_healthy(&proxy).await;
     proxy.stop().await;
 }
+
+/// a response that goes stale after a second, which the proxy may then
+/// serve stale while it revalidates it in the background.
+fn stale_head(framing: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncache-control: max-age=1, stale-while-revalidate=60\r\n\
+         etag: \"v1\"\r\n{framing}\r\n\r\n"
+    )
+}
+
+async fn background_refreshes(proxy: &Running) -> u64 {
+    let client = common::client::<Empty<Bytes>>();
+    let resp = timeout(PATIENCE, client.get(proxy.url("/health").parse().unwrap()))
+        .await
+        .expect("health check timed out")
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let health: serde_json::Value =
+        serde_json::from_slice(&common::body_bytes(resp.into_body()).await).unwrap();
+    health["cache"]["background_refreshes"].as_u64().unwrap()
+}
+
+#[actix_web::test]
+async fn background_revalidation_whose_body_stalls_is_given_up() {
+    let first = Reply {
+        head: stale_head("content-length: 5"),
+        parts: vec![(Duration::ZERO, b"first".to_vec())],
+        stall: false,
+    };
+    let stalled = Reply {
+        head: stale_head("content-length: 100"),
+        parts: vec![(Duration::ZERO, vec![b'a'; 40])],
+        stall: true,
+    };
+    let not_modified = Reply {
+        head: "HTTP/1.1 304 Not Modified\r\netag: \"v1\"\r\n\r\n".to_owned(),
+        parts: Vec::new(),
+        stall: false,
+    };
+    let mut origin = scripted_origin(vec![first, stalled, not_modified]).await;
+    let proxy = spawn(&origin);
+
+    raw_get(&proxy, "/page").await;
+    // max-age has a granularity of one second
+    actix_web::rt::time::sleep(Duration::from_millis(1100)).await;
+    let started = Instant::now();
+    let (response, _) = raw_get(&proxy, "/page").await;
+    let (head, _) = split(&response);
+    assert!(head.contains("x-shadowstep-cache: stale"), "{head}");
+    origin_connection_closed(&mut origin, 1).await;
+    assert_given_up_in_time(started.elapsed());
+
+    // the refresh guard drops just after the origin connection closes
+    while background_refreshes(&proxy).await < 2 {
+        assert!(started.elapsed() < PATIENCE, "no second revalidation");
+        raw_get(&proxy, "/page").await;
+    }
+    assert_eq!(background_refreshes(&proxy).await, 2);
+    assert!(
+        started.elapsed() < IDLE + MARGIN,
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(origin.connections.load(Ordering::SeqCst), 3);
+    proxy.stop().await;
+}

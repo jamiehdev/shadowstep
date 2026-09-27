@@ -326,7 +326,9 @@ fn refresh_in_background(
             tokio::time::timeout(state.upstream_timeout, state.http_client.request(hyper_req))
                 .await;
         match upstream {
-            Ok(Ok(response)) => refresh(&req, &state, cache_key, &entry, response).await,
+            Ok(Ok(response)) => {
+                refresh(&req, &state, cache_key, &entry, response, target_uri).await
+            }
             Ok(Err(e)) => warn!("Background revalidation of {} failed: {}", target_uri, e),
             Err(_) => warn!("Background revalidation of {} timed out", target_uri),
         }
@@ -342,6 +344,7 @@ async fn refresh(
     cache_key: PrimaryKey,
     entry: &StaleEntry,
     response: hyper::Response<Incoming>,
+    target_uri: Uri,
 ) {
     let (parts, body) = response.into_parts();
     let head = Head::from_upstream(&parts);
@@ -361,6 +364,8 @@ async fn refresh(
         return;
     };
     let limit = usize::try_from(store.limit).unwrap_or(usize::MAX);
+    let body = origin_body(body, state.upstream_timeout, target_uri);
+    let body = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
     match Limited::new(body, limit).collect().await {
         Ok(collected) => (store.finish)(
             head.status,
