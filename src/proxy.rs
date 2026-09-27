@@ -8,6 +8,7 @@ use log::{debug, error, warn};
 use std::convert::TryFrom;
 use url::Position;
 
+use crate::forwarded::{ClientInfo, CLIENT_FORWARDING_HEADERS};
 use crate::AppState;
 
 pub async fn forward_to_upstream(
@@ -15,17 +16,13 @@ pub async fn forward_to_upstream(
     payload: web::Payload,
     state: web::Data<AppState>,
 ) -> HttpResponse {
-    let client_ip = req
-        .connection_info()
-        .realip_remote_addr()
-        .unwrap_or("unknown")
-        .to_string();
+    let client = ClientInfo::from_request(&req);
 
     debug!(
-        "Incoming proxy request: {:?} {} from {}",
+        "Incoming proxy request: {:?} {} from {:?}",
         req.method(),
         req.uri(),
-        client_ip
+        client.ip
     );
 
     let path_and_query = req.uri().path_and_query().map_or("", |pq| pq.as_str());
@@ -51,8 +48,11 @@ pub async fn forward_to_upstream(
 
     let options = connection_options(req.headers().get_all(header::CONNECTION));
     for (name, value) in req.headers().iter() {
-        // the Host header is set from upstream_base_url below
-        if name != header::HOST && is_end_to_end(name, &options) {
+        // the Host and forwarding headers are set below
+        if name != header::HOST
+            && !CLIENT_FORWARDING_HEADERS.contains(name)
+            && is_end_to_end(name, &options)
+        {
             hyper_req_builder = hyper_req_builder.header(name.clone(), value.clone());
         }
     }
@@ -74,11 +74,11 @@ pub async fn forward_to_upstream(
         hyper_req_builder = hyper_req_builder.header(header::HOST, host_header_val);
     }
 
-    // add X-Forwarded-* headers
-    hyper_req_builder = hyper_req_builder.header("X-Forwarded-For", client_ip.clone());
-    hyper_req_builder =
-        hyper_req_builder.header("X-Forwarded-Proto", req.connection_info().scheme());
-    hyper_req_builder = hyper_req_builder.header("X-Forwarded-Host", req.connection_info().host());
+    if let Some(ip) = client.ip {
+        hyper_req_builder = hyper_req_builder.header("X-Forwarded-For", ip.to_string());
+    }
+    hyper_req_builder = hyper_req_builder.header("X-Forwarded-Proto", client.scheme);
+    hyper_req_builder = hyper_req_builder.header("X-Forwarded-Host", client.host);
 
     let body = match request_body(payload).await {
         Ok(body) => body,
