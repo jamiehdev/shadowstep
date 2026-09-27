@@ -317,3 +317,28 @@ async fn response_starts_before_the_origin_finishes() {
     release.send(()).unwrap();
     assert_eq!(test::read_body(resp).await.as_ref(), b"firstlast");
 }
+
+#[actix_web::test]
+async fn url_override_headers_do_not_reach_origin() {
+    let origin = origin_accepting("GET", "/page").await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/page")
+            .insert_header(("x-original-url", "/admin"))
+            .insert_header(("x-rewrite-url", "/admin"))
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = only_request(&origin).await;
+    for name in ["x-original-url", "x-rewrite-url"] {
+        assert!(
+            received.headers.get(name).is_none(),
+            "{name} reached the origin"
+        );
+    }
+}

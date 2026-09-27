@@ -547,24 +547,64 @@ async fn different_queries_are_different_keys() {
     assert_eq!(origin_requests(&origin).await, 3);
 }
 
-#[actix_web::test]
-async fn different_schemes_are_different_keys() {
-    let origin = origin_responding(ok_with("max-age=60")).await;
-    let (app, _assets) = common::service(&origin.uri()).await;
-    let with_proto = |proto: &str| {
-        get("/page")
-            .insert_header(("x-forwarded-proto", proto))
-            .to_request()
-    };
+/// answers with a cacheable body that lists the `X-Forwarded-Host` values
+/// the origin received, as an origin that builds links from them would.
+struct EchoForwardedHost;
 
-    let mut seen = Vec::new();
-    for proto in ["http", "https", "http"] {
-        let resp = test::call_service(&app, with_proto(proto)).await;
-        seen.push(cache_status(&resp));
-        test::read_body(resp).await;
+impl wiremock::Respond for EchoForwardedHost {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let hosts: Vec<_> = request
+            .headers
+            .get_all("x-forwarded-host")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect();
+        ok_with("max-age=60").set_body_string(hosts.join(","))
     }
+}
 
-    assert_eq!(seen, ["MISS", "MISS", "HIT"]);
+#[actix_web::test]
+async fn spoofed_forwarding_headers_do_not_poison_the_cache() {
+    let origin = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(EchoForwardedHost)
+        .mount(&origin)
+        .await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let spoofed = get("/page")
+        .insert_header(("host", "real.example"))
+        .insert_header(("forwarded", "host=real.example"))
+        .insert_header(("x-forwarded-host", "evil.example"));
+    test::read_body(test::call_service(&app, spoofed.to_request()).await).await;
+    let normal = get("/page").insert_header(("host", "real.example"));
+    let body = test::read_body(test::call_service(&app, normal.to_request()).await).await;
+
+    let body = String::from_utf8_lossy(&body);
+    assert!(!body.contains("evil.example"), "served {body:?}");
+    assert_eq!(body, "real.example");
+}
+
+#[actix_web::test]
+async fn forwarding_headers_do_not_change_the_cache_key() {
+    for spoofed in [
+        ("x-forwarded-host", "other.example"),
+        ("x-forwarded-proto", "https"),
+        ("forwarded", "host=other.example;proto=https"),
+    ] {
+        let origin = origin_responding(ok_with("max-age=60")).await;
+        let (app, _assets) = common::service(&origin.uri()).await;
+
+        let plain = get("/page").insert_header(("host", "real.example"));
+        test::read_body(test::call_service(&app, plain.to_request()).await).await;
+        let with_header = get("/page")
+            .insert_header(("host", "real.example"))
+            .insert_header(spoofed);
+        let resp = test::call_service(&app, with_header.to_request()).await;
+
+        assert_eq!(cache_status(&resp), "HIT", "{spoofed:?} changed the key");
+        assert_eq!(origin_requests(&origin).await, 1, "{spoofed:?}");
+    }
 }
 
 #[actix_web::test]
