@@ -2,7 +2,10 @@ use crate::common;
 
 use actix_web::http::StatusCode;
 use actix_web::test;
-use hyper::body::Bytes;
+use futures_util::StreamExt;
+use http_body_util::{Empty, Full, StreamBody};
+use hyper::body::{Bytes, Frame};
+use std::convert::Infallible;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -76,22 +79,57 @@ async fn put_body_reaches_origin() {
 }
 
 #[actix_web::test]
+async fn get_without_a_body_reaches_origin_without_body_fields() {
+    let origin = origin_accepting("GET", "/page").await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let resp = test::call_service(&app, test::TestRequest::get().uri("/page").to_request()).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = only_request(&origin).await;
+    assert!(received.headers.get("transfer-encoding").is_none());
+    assert!(received.headers.get("content-length").is_none());
+    assert!(received.body.is_empty());
+}
+
+// hyper sends a GET, HEAD or CONNECT body of unknown length as no body at
+// all, so only another method shows whether an empty payload became a
+// streaming body, which hyper would send chunked
+#[actix_web::test]
+async fn delete_without_a_body_reaches_origin_without_body_fields() {
+    let origin = origin_accepting("DELETE", "/items/1").await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::delete().uri("/items/1").to_request(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = only_request(&origin).await;
+    assert!(received.headers.get("transfer-encoding").is_none());
+    assert!(received.headers.get("content-length").is_none());
+    assert!(received.body.is_empty());
+}
+
+#[actix_web::test]
 async fn large_post_body_reaches_origin_with_its_length() {
     let origin = origin_accepting("POST", "/upload").await;
     let server = common::spawn(&origin.uri());
-    let client = hyper::Client::new();
+    let client = common::client();
     let body = patterned_body(MIB);
 
     let resp = client
         .request(
             hyper::Request::post(server.url("/upload"))
-                .body(hyper::Body::from(body.clone()))
+                .body(Full::new(Bytes::from(body.clone())))
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), hyper::StatusCode::OK);
     let received = only_request(&origin).await;
     assert_eq!(received.headers.get("content-length").unwrap(), "1048576");
     assert!(received.body == body, "origin received a different body");
@@ -103,13 +141,17 @@ async fn large_post_body_reaches_origin_with_its_length() {
 async fn chunked_post_body_reaches_origin() {
     let origin = origin_accepting("POST", "/upload").await;
     let server = common::spawn(&origin.uri());
-    let client = hyper::Client::new();
+    let client = common::client();
     let body = patterned_body(MIB);
-    let (mut sender, request_body) = hyper::Body::channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let request_body = StreamBody::new(
+        futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx))
+            .map(|chunk| Ok::<_, Infallible>(Frame::data(chunk))),
+    );
     let chunks: Vec<Bytes> = body.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
     actix_web::rt::spawn(async move {
         for chunk in chunks {
-            sender.send_data(chunk).await.unwrap();
+            sender.send(chunk).await.unwrap();
         }
     });
 
@@ -122,7 +164,7 @@ async fn chunked_post_body_reaches_origin() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), hyper::StatusCode::OK);
     let received = only_request(&origin).await;
     assert!(received.body == body, "origin received a different body");
     drop(client);
@@ -262,16 +304,16 @@ async fn large_response_arrives_intact() {
         .mount(&origin)
         .await;
     let server = common::spawn(&origin.uri());
-    let client = hyper::Client::new();
+    let client = common::client::<Empty<Bytes>>();
 
     let resp = client
         .get(server.url("/large").parse().unwrap())
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), hyper::StatusCode::OK);
     assert_eq!(resp.headers().get("content-length").unwrap(), "4194304");
-    let received = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let received = common::body_bytes(resp.into_body()).await;
     assert!(received == body, "client received a different body");
     drop(client);
     server.stop().await;

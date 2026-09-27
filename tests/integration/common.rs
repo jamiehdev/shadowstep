@@ -1,6 +1,12 @@
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceResponse};
 use actix_web::{test, web};
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::{Body, Incoming};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use shadowstep::config::Config;
 use shadowstep::{app, build_state, run, AppState};
 use std::net::{SocketAddr, TcpListener};
@@ -117,4 +123,18 @@ pub fn cache_status<B>(resp: &ServiceResponse<B>) -> String {
         .get("x-shadowstep-cache")
         .map(|v| v.to_str().unwrap().to_owned())
         .unwrap_or_default()
+}
+
+/// a plain HTTP client that sends request bodies of type `B`.
+pub fn client<B>() -> Client<HttpConnector, B>
+where
+    B: Body + Send,
+    B::Data: Send,
+{
+    Client::builder(TokioExecutor::new()).build_http()
+}
+
+/// the whole body of a client response.
+pub async fn body_bytes(body: Incoming) -> Bytes {
+    body.collect().await.unwrap().to_bytes()
 }

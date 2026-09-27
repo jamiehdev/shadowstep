@@ -2,6 +2,8 @@ use crate::common::{self, cache_status};
 
 use actix_web::http::StatusCode;
 use actix_web::test;
+use bytes::Bytes;
+use http_body_util::Empty;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -617,7 +619,7 @@ async fn oversized_body_streams_through_uncached() {
     )
     .await;
     let server = common::spawn(&origin.uri());
-    let client = hyper::Client::new();
+    let client = common::client::<Empty<Bytes>>();
 
     for _ in 0..2 {
         let resp = client
@@ -626,7 +628,7 @@ async fn oversized_body_streams_through_uncached() {
             .unwrap();
         assert_eq!(resp.headers().get("x-shadowstep-cache").unwrap(), "MISS");
         assert_eq!(resp.headers().get("content-length").unwrap(), "9437184");
-        let received = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let received = common::body_bytes(resp.into_body()).await;
         assert!(received == body, "client received a different body");
     }
 

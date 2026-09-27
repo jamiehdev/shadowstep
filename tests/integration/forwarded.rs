@@ -4,7 +4,8 @@
 
 use crate::common;
 
-use actix_web::http::StatusCode;
+use bytes::Bytes;
+use http_body_util::Empty;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -24,17 +25,17 @@ async fn origin() -> MockServer {
 async fn forwarded_request(headers: &[(&str, &str)]) -> (wiremock::Request, String) {
     let origin = origin().await;
     let server = common::spawn(&origin.uri());
-    let client = hyper::Client::new();
+    let client = common::client();
 
     let mut request = hyper::Request::get(server.url("/page"));
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
     let resp = client
-        .request(request.body(hyper::Body::empty()).unwrap())
+        .request(request.body(Empty::<Bytes>::new()).unwrap())
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), hyper::StatusCode::OK);
 
     let mut received = origin.received_requests().await.unwrap();
     assert_eq!(received.len(), 1);
