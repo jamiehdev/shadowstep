@@ -18,14 +18,20 @@ pub fn config(origin_url: &str, asset_path: &Path) -> Config {
         cache_size_mb: 100,
         tls_cert_path: None,
         tls_key_path: None,
+        upstream_timeout_seconds: 30,
     }
 }
 
 /// state pointing at `origin_url`, with an empty asset directory that lives
-/// as long as the returned `TempDir`.
-pub fn state(origin_url: &str) -> (web::Data<AppState>, TempDir) {
+/// as long as the returned `TempDir`. `customise` adjusts the test config.
+pub fn state_with(
+    origin_url: &str,
+    customise: impl FnOnce(&mut Config),
+) -> (web::Data<AppState>, TempDir) {
     let assets = tempfile::tempdir().unwrap();
-    let state = build_state(&config(origin_url, assets.path())).unwrap();
+    let mut config = config(origin_url, assets.path());
+    customise(&mut config);
+    let state = build_state(&config).unwrap();
     (state, assets)
 }
 
@@ -40,7 +46,22 @@ pub async fn service(
     >,
     TempDir,
 ) {
-    let (state, assets) = state(origin_url);
+    service_with(origin_url, |_| {}).await
+}
+
+/// `service` with a customised config.
+pub async fn service_with(
+    origin_url: &str,
+    customise: impl FnOnce(&mut Config),
+) -> (
+    impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+    >,
+    TempDir,
+) {
+    let (state, assets) = state_with(origin_url, customise);
     (test::init_service(app(state)).await, assets)
 }
 
@@ -62,7 +83,7 @@ impl Running {
 }
 
 pub fn spawn(origin_url: &str) -> Running {
-    let (state, assets) = state(origin_url);
+    let (state, assets) = state_with(origin_url, |_| {});
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = run(state, listener, None, 1).unwrap();

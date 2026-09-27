@@ -30,6 +30,11 @@ pub struct Config {
     /// tls key path
     #[clap(long, env = "TLS_KEY_PATH", long = "tls-key")]
     pub tls_key_path: Option<PathBuf>,
+
+    /// seconds to wait for the origin's response headers, including the time
+    /// to send the request body. the proxy answers 504 when it runs out.
+    #[clap(long, env = "UPSTREAM_TIMEOUT_SECONDS", default_value_t = 30)]
+    pub upstream_timeout_seconds: u64,
 }
 
 impl Config {
