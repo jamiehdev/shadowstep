@@ -1,6 +1,6 @@
 # shadowstep
 
-A small caching reverse proxy written in Rust (actix-web 4, hyper 0.14, rustls 0.20). It serves local files from an asset directory, forwards every other request to one upstream origin, and keeps cacheable origin responses in memory.
+A small caching reverse proxy written in Rust (actix-web 4, hyper 1, rustls 0.23). It serves local files from an asset directory, forwards every other request to one upstream origin, and keeps cacheable origin responses in memory.
 
 ## What it does
 
@@ -80,6 +80,24 @@ Known limits:
 - There is no request coalescing. Concurrent misses for the same URL all go to the origin.
 - The host is part of the key, so a client that sends many different `Host` values can create many entries. The byte bound on the cache still applies.
 - Each process has its own cache. Replicas do not share entries or invalidations.
+
+## Install
+
+Each release tag `vX.Y.Z` publishes a multi-platform image for `linux/amd64` and `linux/arm64` to `ghcr.io/jamiehdev/shadowstep`, tagged `X.Y.Z`, `X.Y` and `latest`. A pre-release tag such as `v2.1.0-rc.1` publishes only `2.1.0-rc.1`.
+
+```bash
+docker pull ghcr.io/jamiehdev/shadowstep:2.0.0
+```
+
+The image carries SLSA provenance and an SBOM. To check that an image was built by this repository's release workflow:
+
+```bash
+gh attestation verify oci://ghcr.io/jamiehdev/shadowstep:2.0.0 --owner jamiehdev
+```
+
+Releases do not include prebuilt binaries. To run outside a container, build from source as shown in [Build](#build).
+
+See [Docker](#docker) for running the image.
 
 ## Build
 
