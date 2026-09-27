@@ -215,4 +215,4 @@ cargo test --locked
 
 ## Licence
 
-[MIT](https://opensource.org/licenses/MIT)
+[MIT](LICENSE)
