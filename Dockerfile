@@ -28,7 +28,8 @@ WORKDIR /app
 COPY --from=builder /usr/src/shadowstep/target/release/shadowstep /usr/local/bin/shadowstep
 
 EXPOSE 8080
-# the HTTPS listener binds 0.0.0.0:8443 when both TLS paths are set
+# the HTTPS listener binds TLS_LISTEN_ADDR (default 0.0.0.0:8443) when both
+# TLS paths are set
 EXPOSE 8443
 
 USER shadowstep

@@ -30,7 +30,7 @@ spec:
         ports:
         - name: http
           containerPort: 8080
-        # the binary binds 0.0.0.0:8443 for HTTPS when both TLS paths are set
+        # must match the port in TLS_LISTEN_ADDR below
         - name: https
           containerPort: 8443
         resources:
@@ -49,6 +49,12 @@ spec:
           value: "/etc/tls/tls.crt"
         - name: TLS_KEY_PATH
           value: "/etc/tls/tls.key"
+        - name: TLS_LISTEN_ADDR
+          value: "0.0.0.0:8443"
+        # the cache holds up to this many MiB in memory, so keep it well under
+        # the memory limit above
+        - name: CACHE_SIZE_MB
+          value: "100"
         # /app/assets is not mounted over: the image ships the assets it serves
         volumeMounts:
         - name: tls
