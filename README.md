@@ -1,6 +1,6 @@
 # shadowstep
 
-A small caching reverse proxy written in Rust (actix-web 4, hyper 0.14, rustls 0.20). It serves local files from an asset directory, forwards every other request to one upstream origin, and keeps cacheable origin responses in memory.
+A small caching reverse proxy written in Rust (actix-web 4, hyper 1, rustls 0.23). It serves local files from an asset directory, forwards every other request to one upstream origin, and keeps cacheable origin responses in memory.
 
 ## What it does
 
