@@ -31,6 +31,10 @@ pub struct Config {
     #[clap(long, env = "TLS_KEY_PATH", long = "tls-key")]
     pub tls_key_path: Option<PathBuf>,
 
+    /// https listen address, used only when both tls paths are set
+    #[clap(long, env = "TLS_LISTEN_ADDR", default_value = "0.0.0.0:8443")]
+    pub tls_listen_addr: String,
+
     /// seconds to wait for the origin's response headers, including the time
     /// to send the request body. the proxy answers 504 when it runs out.
     #[clap(long, env = "UPSTREAM_TIMEOUT_SECONDS", default_value_t = 30)]

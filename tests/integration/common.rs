@@ -18,6 +18,7 @@ pub fn config(origin_url: &str, asset_path: &Path) -> Config {
         cache_size_mb: 100,
         tls_cert_path: None,
         tls_key_path: None,
+        tls_listen_addr: "127.0.0.1:0".to_owned(),
         upstream_timeout_seconds: 30,
     }
 }

@@ -1,9 +1,8 @@
 use log::info;
 use shadowstep::config::Config;
-use shadowstep::tls::load_rustls_config;
+use shadowstep::tls::bind_listeners;
 use shadowstep::{build_state, run};
 use std::io;
-use std::net::TcpListener;
 use std::num::NonZeroUsize;
 
 #[actix_web::main]
@@ -19,15 +18,7 @@ async fn main() -> io::Result<()> {
         config.listen_addr, num_workers
     );
 
-    let http = TcpListener::bind(&config.listen_addr)?;
-
-    let tls = match (config.tls_cert_path.as_ref(), config.tls_key_path.as_ref()) {
-        (Some(cert_path), Some(key_path)) => {
-            let tls_config = load_rustls_config(cert_path, key_path)?;
-            Some((TcpListener::bind("0.0.0.0:8443")?, tls_config))
-        }
-        _ => None,
-    };
+    let (http, tls) = bind_listeners(&config)?;
 
     run(state, http, tls, num_workers)?.await
 }
