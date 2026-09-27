@@ -17,11 +17,12 @@ use tokio::sync::mpsc;
 use url::{Position, Url};
 
 use crate::cache::{
-    self, Fields, Lookup, PrimaryKey, RequestPolicy, StaleEntry, StoredResponse,
+    self, Fields, FlightKey, Lookup, PrimaryKey, RequestPolicy, StaleEntry, StoredResponse,
     PRECONDITION_HEADERS,
 };
+use crate::coalesce::{FlightGuard, Join, Waiter};
 use crate::forwarded::{ClientInfo, CLIENT_FORWARDING_HEADERS, URL_OVERRIDE_HEADERS};
-use crate::AppState;
+use crate::{AppState, CacheStats};
 
 const CACHE_STATUS: &str = "x-shadowstep-cache";
 
@@ -29,6 +30,8 @@ type BodyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// the body of a request to the origin.
 pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, BodyError>;
+
+type Flight = FlightGuard<FlightKey>;
 
 pub async fn forward_to_upstream(
     req: HttpRequest,
@@ -49,11 +52,11 @@ pub async fn forward_to_upstream(
     // X-Forwarded-Proto and X-Forwarded-Host that the origin receives
     let cache_key = PrimaryKey::new(client.scheme, &client.host, path_and_query);
     let request_policy = RequestPolicy::new(req.method(), req.headers());
-    let stale = match from_cache(&req, &state, &cache_key, &request_policy) {
-        Cached::Answer(response) => return response,
-        Cached::Stale(entry) => Some(entry),
-        Cached::Nothing => None,
-    };
+    let ToOrigin { stale, flight } =
+        match serve_from_cache(&req, &state, &cache_key, &request_policy).await {
+            Before::Answer(response) => return response,
+            Before::Origin(to_origin) => to_origin,
+        };
 
     let Some((builder, target_uri)) = upstream_request(&req, &state, &client, path_and_query)
     else {
@@ -74,6 +77,7 @@ pub async fn forward_to_upstream(
         cache_key,
         request_policy,
         stale,
+        flight,
     };
 
     let hyper_req = match origin_request(builder, payload).await {
@@ -112,6 +116,107 @@ pub async fn forward_to_upstream(
     }
 }
 
+/// what the cache did for a request before any origin request.
+enum Before {
+    /// the cache answers the request
+    Answer(HttpResponse),
+    /// the request goes to the origin
+    Origin(ToOrigin),
+}
+
+/// what a request takes to the origin.
+struct ToOrigin {
+    /// the stored response to revalidate
+    stale: Option<StaleEntry>,
+    /// the flight this request leads, which other requests wait for
+    flight: Option<Flight>,
+}
+
+/// the cache's answer to the request, if it has one. a request that may
+/// coalesce and finds no response it can use as is joins the flight for
+/// its key: the first such request leads it to the origin, and the others
+/// wait for the leader to finish and then look again.
+async fn serve_from_cache(
+    req: &HttpRequest,
+    state: &web::Data<AppState>,
+    cache_key: &PrimaryKey,
+    request_policy: &RequestPolicy,
+) -> Before {
+    let to_origin = match from_cache(req, state, cache_key, request_policy, FreshUse::Hit).or(None)
+    {
+        Before::Origin(to_origin) => to_origin,
+        answer => return answer,
+    };
+    let (flight, fresh_use) = match join_flight(req, state, cache_key, request_policy) {
+        Join::Alone => return Before::Origin(to_origin),
+        Join::Lead(flight) => (Some(flight), FreshUse::Hit),
+        Join::Follow(waiter) => {
+            wait_for_leader(req, state, waiter).await;
+            (None, FreshUse::Coalesced)
+        }
+    };
+    // a leader looks again because a flight for the key may have stored a
+    // response and ended since the first lookup. a follower that still
+    // finds nothing it may use goes to the origin alone, because the
+    // leader's response was not storable, did not match this request's
+    // `Vary` values or failed, and RFC 9111 section 3 lets a shared cache
+    // pass on only what it stores.
+    from_cache(req, state, cache_key, request_policy, fresh_use).or(flight)
+}
+
+/// the request's part in the flight for its key.
+fn join_flight(
+    req: &HttpRequest,
+    state: &AppState,
+    cache_key: &PrimaryKey,
+    request_policy: &RequestPolicy,
+) -> Join<FlightKey> {
+    if !request_policy.may_coalesce() {
+        return Join::Alone;
+    }
+    match state.cache.flight_key(cache_key, req.headers()) {
+        Some(key) => state.flights.join(key, request_policy.may_lead()),
+        None => Join::Alone,
+    }
+}
+
+/// waits for the leader of a flight for no longer than the leader may wait
+/// for the origin's response headers. a follower whose wait runs out goes
+/// to the origin itself.
+async fn wait_for_leader(req: &HttpRequest, state: &AppState, waiter: Waiter) {
+    if tokio::time::timeout(state.upstream_timeout, waiter.wait())
+        .await
+        .is_err()
+    {
+        debug!("Stopped waiting for a concurrent request for {}", req.uri());
+    }
+}
+
+/// how a fresh stored response came to answer a request.
+#[derive(Clone, Copy)]
+enum FreshUse {
+    /// found on the request's own lookup
+    Hit,
+    /// stored by the flight this request waited for
+    Coalesced,
+}
+
+impl FreshUse {
+    /// counts the use and returns its `X-Shadowstep-Cache` value.
+    fn count(self, stats: &CacheStats) -> &'static str {
+        match self {
+            FreshUse::Hit => {
+                stats.hit();
+                "HIT"
+            }
+            FreshUse::Coalesced => {
+                stats.coalesced();
+                "COALESCED"
+            }
+        }
+    }
+}
+
 /// what the cache can do for a request before it goes to the origin.
 enum Cached {
     /// the cache answers the request
@@ -122,6 +227,18 @@ enum Cached {
     Nothing,
 }
 
+impl Cached {
+    /// the cache's answer, or the origin request with `flight`.
+    fn or(self, flight: Option<Flight>) -> Before {
+        let stale = match self {
+            Cached::Answer(response) => return Before::Answer(response),
+            Cached::Stale(entry) => Some(entry),
+            Cached::Nothing => None,
+        };
+        Before::Origin(ToOrigin { stale, flight })
+    }
+}
+
 /// the stored response for this request, if any, and whether it answers the
 /// request. only GET requests use stale responses, because a revalidation
 /// or a stored replacement needs a GET to the origin.
@@ -130,6 +247,7 @@ fn from_cache(
     state: &web::Data<AppState>,
     cache_key: &PrimaryKey,
     request_policy: &RequestPolicy,
+    fresh_use: FreshUse,
 ) -> Cached {
     if !request_policy.may_serve {
         return Cached::Nothing;
@@ -140,8 +258,8 @@ fn from_cache(
     {
         Some(Lookup::Fresh(stored)) => {
             debug!("Cache hit for {} {}", req.method(), req.uri());
-            state.cache_stats.hit();
-            Cached::Answer(cached_response(&stored, "HIT"))
+            let cache_status = fresh_use.count(&state.cache_stats);
+            Cached::Answer(cached_response(&stored, cache_status))
         }
         Some(Lookup::Stale(entry)) if req.method() == Method::GET => {
             while_revalidating(req, state, cache_key, request_policy, entry)
@@ -268,6 +386,9 @@ struct Exchange {
     stale: Option<StaleEntry>,
     /// whether the origin request carries the stale response's validators
     revalidating: bool,
+    /// the flight this request leads. it ends when the exchange does, or
+    /// once the response is stored or known not to be
+    flight: Option<Flight>,
 }
 
 impl Exchange {
@@ -284,6 +405,7 @@ impl Exchange {
             }
         }
         self.state.cache_stats.miss();
+        let flight = self.flight;
         let store = store_plan(
             &self.req,
             &self.state,
@@ -291,7 +413,7 @@ impl Exchange {
             &self.request_policy,
             &head,
         );
-        client_response(head, body, store)
+        client_response(head, body, store.map(|store| store.holding(flight)))
     }
 
     /// the client's response when the origin could not be reached or sent no
@@ -545,6 +667,23 @@ struct Storing {
     /// the largest body to store
     limit: u64,
     finish: Box<dyn FnOnce(StatusCode, Fields, Bytes)>,
+}
+
+impl Storing {
+    /// keeps `flight` until the response is stored, or until the copy of
+    /// its body is given up because it passed the limit, failed or was
+    /// dropped with the client's response, so that followers look up the
+    /// cache only once the outcome is known.
+    fn holding(self, flight: Option<Flight>) -> Self {
+        let Storing { limit, finish } = self;
+        Storing {
+            limit,
+            finish: Box::new(move |status, headers, body| {
+                finish(status, headers, body);
+                drop(flight);
+            }),
+        }
+    }
 }
 
 /// a body on its way into the cache.

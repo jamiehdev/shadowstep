@@ -1,5 +1,6 @@
 mod body_failure;
 mod cache;
+mod coalescing;
 mod common;
 mod forwarded;
 mod http2;

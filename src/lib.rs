@@ -12,6 +12,7 @@ pub mod tls;
 
 mod assets;
 mod cache;
+mod coalesce;
 mod forwarded;
 mod proxy;
 
@@ -32,12 +33,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::cache::Store;
+use crate::cache::{FlightKey, Store};
+use crate::coalesce::Flights;
 use crate::config::Config;
 
 /// how the cache answered requests. each proxied or asset response counts
-/// once, as a hit, a miss, a revalidation or a stale serve. background
-/// refreshes count the background revalidations started.
+/// once, as a hit, a miss, a revalidation, a stale serve or a coalesced
+/// serve. background refreshes count the background revalidations started.
 #[derive(Default)]
 pub struct CacheStats {
     hits: AtomicU64,
@@ -45,6 +47,7 @@ pub struct CacheStats {
     revalidations: AtomicU64,
     stale: AtomicU64,
     background_refreshes: AtomicU64,
+    coalesced: AtomicU64,
 }
 
 impl CacheStats {
@@ -69,12 +72,18 @@ impl CacheStats {
     fn background_refresh(&self) {
         self.background_refreshes.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// a response stored by a concurrent request that this one waited for
+    fn coalesced(&self) {
+        self.coalesced.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// application state, including cache
 pub struct AppState {
     cache_stats: CacheStats,
     cache: Store,
+    flights: Flights<FlightKey>,
     http_client: Client<HttpsConnector<HttpConnector>, proxy::UpstreamBody>,
     upstream_base_url: Url,
     asset_path: PathBuf,
@@ -88,8 +97,9 @@ async fn health_check(state: web::Data<AppState>) -> impl Responder {
     let misses = stats.misses.load(Ordering::Relaxed);
     let revalidations = stats.revalidations.load(Ordering::Relaxed);
     let stale = stats.stale.load(Ordering::Relaxed);
+    let coalesced = stats.coalesced.load(Ordering::Relaxed);
     // the share of responses whose body came from the cache
-    let from_cache = hits + revalidations + stale;
+    let from_cache = hits + revalidations + stale + coalesced;
     let total = from_cache + misses;
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
@@ -98,6 +108,7 @@ async fn health_check(state: web::Data<AppState>) -> impl Responder {
             "misses": misses,
             "revalidations": revalidations,
             "stale": stale,
+            "coalesced": coalesced,
             "background_refreshes": stats.background_refreshes.load(Ordering::Relaxed),
             "items": state.cache.entry_count(),
             "bytes": state.cache.weighted_size(),
@@ -142,6 +153,7 @@ pub fn build_state(config: &Config) -> io::Result<web::Data<AppState>> {
             config.cache_size_mb,
             Duration::from_secs(config.cache_ttl_seconds),
         ),
+        flights: Flights::default(),
         http_client,
         upstream_base_url,
         asset_path: config.asset_path.clone(),
