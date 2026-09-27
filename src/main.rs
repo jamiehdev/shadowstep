@@ -9,7 +9,7 @@
 //! 
 
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, middleware::{Compress, Logger}};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use actix_web::http::header::{CACHE_CONTROL, ETAG};
 use std::collections::HashMap;
@@ -78,6 +78,25 @@ fn load_rustls_config(cert_path: &std::path::Path, key_path: &std::path::Path) -
     Ok(config)
 }
 
+/// resolves `requested` to a file inside `root`, or `None` if it is missing
+/// or would escape the root. `requested` arrives percent-decoded, so
+/// `..%2f` and `%2e%2e` reach this point as `../`.
+async fn resolve_asset(root: &Path, requested: &str) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for segment in requested.split('/') {
+        let mut components = Path::new(segment).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) if name == segment => relative.push(name),
+            _ => return None,
+        }
+    }
+
+    // canonicalising both sides catches symlinks that point outside the root
+    let root = tokio::fs::canonicalize(root).await.ok()?;
+    let resolved = tokio::fs::canonicalize(root.join(relative)).await.ok()?;
+    resolved.starts_with(&root).then_some(resolved)
+}
+
 #[get("/assets/{filename:.*}")]
 async fn serve_asset(
     path: web::Path<String>,
@@ -85,7 +104,12 @@ async fn serve_asset(
     req: actix_web::HttpRequest,
 ) -> impl Responder {
     let filename = path.into_inner();
-    
+
+    let Some(path) = resolve_asset(&state.asset_path, &filename).await else {
+        warn!("Asset not found: {}", filename);
+        return HttpResponse::NotFound().body("not found");
+    };
+
     let cache = state.cache.clone();
     
     // scoped read lock
@@ -123,8 +147,6 @@ async fn serve_asset(
     }
     
     // if not in cache, read from the filesystem.
-    let path = state.asset_path.join(&filename); // Use asset_path from state
-    
     // debug print
     println!("Looking for file at: {:?}", path);
     
@@ -240,4 +262,123 @@ async fn main() -> std::io::Result<()> {
     }
 
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http::StatusCode, test};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SECRET: &str = "secret contents outside the asset root";
+
+    // layout: <tmp>/assets/app.css is servable, <tmp>/secret.txt must not be
+    fn fixture() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "shadowstep-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets").join("app.css"), "body{}").unwrap();
+        std::fs::write(dir.join("secret.txt"), SECRET).unwrap();
+        dir
+    }
+
+    fn state(asset_path: PathBuf) -> web::Data<AppState> {
+        let https = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        web::Data::new(AppState {
+            cache_stats: Mutex::new(CacheStats {
+                hits: 0,
+                misses: 0,
+                items: 0,
+            }),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            http_client: Client::builder().build(https),
+            upstream_base_url: Url::parse("http://127.0.0.1:1").unwrap(),
+            asset_path,
+        })
+    }
+
+    async fn get(uri: &str) -> (StatusCode, bytes::Bytes) {
+        get_in(fixture(), uri).await
+    }
+
+    async fn get_in(dir: PathBuf, uri: &str) -> (StatusCode, bytes::Bytes) {
+        let app = test::init_service(
+            App::new()
+                .app_data(state(dir.join("assets")))
+                .service(serve_asset),
+        )
+        .await;
+        let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        let status = resp.status();
+        let body = test::read_body(resp).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        (status, body)
+    }
+
+    async fn assert_rejected(uri: &str) {
+        assert_rejected_in(fixture(), uri).await;
+    }
+
+    async fn assert_rejected_in(dir: PathBuf, uri: &str) {
+        let (status, body) = get_in(dir, uri).await;
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+            "{uri} returned {status}"
+        );
+        assert_ne!(body.as_ref(), SECRET.as_bytes(), "{uri} leaked the secret");
+    }
+
+    #[actix_web::test]
+    async fn serves_asset_inside_root() {
+        let (status, body) = get("/assets/app.css").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), b"body{}");
+    }
+
+    #[actix_web::test]
+    async fn missing_asset_is_not_found() {
+        let (status, _) = get("/assets/missing.css").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn rejects_literal_dot_dot() {
+        assert_rejected("/assets/../secret.txt").await;
+    }
+
+    #[actix_web::test]
+    async fn rejects_encoded_slash_dot_dot() {
+        assert_rejected("/assets/..%2fsecret.txt").await;
+    }
+
+    #[actix_web::test]
+    async fn rejects_encoded_dots() {
+        assert_rejected("/assets/%2e%2e/secret.txt").await;
+    }
+
+    #[actix_web::test]
+    async fn rejects_absolute_path() {
+        let dir = fixture();
+        let secret = dir.join("secret.txt");
+        let uri = format!("/assets/{}", secret.display());
+        assert_rejected_in(dir, &uri).await;
+    }
+
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn rejects_symlink_out_of_root() {
+        let dir = fixture();
+        std::os::unix::fs::symlink(dir.join("secret.txt"), dir.join("assets").join("link.txt"))
+            .unwrap();
+        assert_rejected_in(dir, "/assets/link.txt").await;
+    }
 }
