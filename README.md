@@ -1,273 +1,220 @@
-# shadowstep🥷
+# shadowstep
 
-a minimal and fairly quick edge CDN written in Rust.
+A small caching reverse proxy written in Rust (actix-web 4, hyper 0.14, rustls 0.20). It serves local files from an asset directory, forwards every other request to one upstream origin, and keeps cacheable origin responses in memory.
 
-## features
+## What it does
 
-### implemented
-* local asset serving (`./assets/`)
-* etag-based in-memory cache (hashmap, no TTL/LRU)
-* gzip compression via actix-web compress middleware
-* health endpoint with cache statistics
-* optional TLS termination (HTTPS)
-* reverse proxy to upstream origin
+- `GET /assets/{path}` serves files from the asset directory. Paths that escape the directory, including through symlinks, return 404.
+- Asset responses carry an `ETag` and `Cache-Control: public, max-age=86400`. A request whose `If-None-Match` equals the file's ETag gets `304 Not Modified`.
+- Every other path is forwarded to the origin with its method, path, query, headers and body. See [Proxying](#proxying).
+- Cacheable origin responses are stored and served from memory. See [Caching](#caching).
+- `GET /health` returns `{"status":"ok","cache":{...}}` with `hits`, `misses`, `hit_ratio`, `items` and `bytes` for the cache.
+- Responses are compressed according to the request's `Accept-Encoding`.
+- HTTPS is served when both a certificate and a key are given. See [TLS](#tls).
 
-### planned
-* cache TTL and LRU eviction
-* metrics endpoint (prometheus)
-* cache purge API (invalidation fun🫣)
+## Proxying
 
-## getting started
+The request path and query are appended to the path of `ORIGIN_URL`, so `--origin-url http://origin.internal/app` sends `/page?x=1` to `http://origin.internal/app/page?x=1`. A query or fragment on `ORIGIN_URL` is dropped.
 
-### prerequisites
+The request body streams to the origin and the response body streams back to the client. `Host` is set to the origin's host, with its port unless that is 80 or 443.
 
-*   rust: install from [rustup.rs](https://rustup.rs/)
-*   git
+Hop-by-hop headers are removed in both directions: `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authenticate`, `Proxy-Authorization`, and every header named in `Connection`.
 
-### clone & build
+shadowstep expects to face clients directly. It removes these client-sent headers and never reads them:
+
+- `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Forwarded-Server` and `X-Real-IP`
+- `X-Forwarded-Prefix`, `X-Forwarded-Uri`, `X-Forwarded-Scheme`, `X-Host`, `X-Original-Host` and `Front-End-Https`, which some origin frameworks use to build links and redirects
+- `X-Original-URL` and `X-Rewrite-URL`, which some origin frameworks use to override the request path
+
+The origin then receives one of each of these headers:
+
+- `X-Forwarded-For`: the IP address of the TCP peer
+- `X-Forwarded-Proto`: `https` on the HTTPS listener, `http` on the plain one
+- `X-Forwarded-Host`: the authority of an absolute-form or HTTP/2 request target, else the request's `Host`
+
+There is no trusted-proxy setting. Behind another load balancer or proxy, `X-Forwarded-For` holds that proxy's address, and any forwarding headers that proxy adds are removed.
+
+`--upstream-timeout-seconds` (default 30) limits how long shadowstep waits for the origin's response headers, including the time to send the request body. The limit does not cover the response body.
+
+Error responses have short generic bodies:
+
+- `502 Bad Gateway`: the origin could not be reached or the connection failed
+- `504 Gateway Timeout`: no response headers within the upstream timeout
+- `400 Bad Request`: reading the request body failed before any of it was sent to the origin
+- `500 Internal Server Error`: the upstream URL or request could not be built
+
+## Caching
+
+Origin responses are cached in memory under the rules of RFC 9111 for a shared cache.
+
+A response to `GET` is stored when all of these hold:
+
+- the status is 200, 203, 204, 300, 301, 308, 404, 405, 410, 414 or 501
+- it has an explicit freshness lifetime from `Cache-Control: s-maxage`, then `max-age`, then `Expires`
+- `Cache-Control` has none of `no-store`, `private` or `no-cache`
+- it has no `Set-Cookie` and no `Vary: *`
+- if the request had `Authorization` or `Cookie`, the response has `Cache-Control: public`
+
+The cache key is the scheme, host, path and query, plus the request's values for each header the response names in `Vary`. The host comes from the same place as `X-Forwarded-Host`.
+
+For each request:
+
+- A `HEAD` request is answered from a stored `GET` response.
+- Request `Cache-Control: no-cache` skips the stored copy, goes to the origin and stores the new response.
+- Request `Cache-Control: no-store` is neither served from the cache nor stored.
+- Request `Cache-Control: max-age=N` skips stored copies older than `N` seconds.
+- A request with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` is forwarded with that header, but is neither served from the cache nor stored, because the origin may treat it as another method.
+- A request with an unsafe method, such as `POST`, `PUT` or `DELETE`, that gets a 2xx or 3xx response removes the stored response for its URL.
+
+Responses served from the cache carry `Age`. Proxied and asset responses carry `X-Shadowstep-Cache: HIT` or `MISS`.
+
+`--cache-ttl-seconds` (default 300) caps how long any entry is kept, whatever the origin's freshness lifetime. `--cache-size-mb` (default 100) bounds origin responses and assets together, measured in bytes. The largest single entry is 8 MiB or the cache size, whichever is smaller. Larger bodies stream to the client without being stored. Setting either option to 0 turns caching off.
+
+Assets share the same cache. A stored asset is read from disk again when the file's size or modified time changes.
+
+`/health` counts hits and misses for proxied requests and assets together. `items` and `bytes` describe the whole cache.
+
+Known limits:
+
+- There is no revalidation. shadowstep never sends conditional requests to the origin, so a stale entry is dropped and fetched again in full.
+- There is no request coalescing. Concurrent misses for the same URL all go to the origin.
+- The host is part of the key, so a client that sends many different `Host` values can create many entries. The byte bound on the cache still applies.
+- Each process has its own cache. Replicas do not share entries or invalidations.
+
+## Build
+
+Install Rust with [rustup](https://rustup.rs/), then:
 
 ```bash
 git clone git@github.com:jamiehdev/shadowstep.git
 cd shadowstep
-cargo build --release
+cargo build --release --locked
 ```
 
-### running
-
-shadowstep can be configured via command-line arguments or environment variables.
+## Run
 
 ```bash
-# example: run shadowstep, proxying to shadowstep.example.com, listening on port 8080
-./target/release/shadowstep --origin http://shadowstep.example.com --listen 0.0.0.0:8080
-```
-
-#### HTTPS example (origin over HTTP is normal)
-```bash
-# run with TLS termination enabled (origin can be HTTP)
 ./target/release/shadowstep \
-  --origin http://shadowstep.example.com \
-  --listen 0.0.0.0:8080 \
-  --tls-cert ./certs/cert.pem \
-  --tls-key ./certs/key.pem
+  --origin-url http://localhost:3000 \
+  --listen-addr 127.0.0.1:8080 \
+  --asset-path ./assets
 ```
 
-or using environment variables:
+The same with environment variables:
 
 ```bash
-ORIGIN_URL="http://shadowstep.example.com" LISTEN_ADDR="0.0.0.0:8080" ./target/release/shadowstep
+ORIGIN_URL=http://localhost:3000 LISTEN_ADDR=127.0.0.1:8080 ASSET_PATH=./assets ./target/release/shadowstep
 ```
 
-## deployment
+The default asset path is `/app/assets`, the path used in the Docker image. When running outside a container, pass `--asset-path`. The directory is created at start-up if it does not exist.
 
-### Docker
+Logging uses `env_logger` at `info` by default, which logs one line per request. Set `RUST_LOG=debug` to also log forwarding and cache decisions.
 
-a `Dockerfile` is provided for building a Docker image. make sure you have your `certs/` directory (with cert.pem and key.pem) in your project root before building.
+## Configuration
+
+Each option can be set with a flag or an environment variable. The flag wins if both are set.
+
+| Flag | Environment variable | Default | Description |
+|---|---|---|---|
+| `--origin-url` | `ORIGIN_URL` | required | Upstream origin URL, for example `http://origin.internal:3000` |
+| `--listen-addr` | `LISTEN_ADDR` | `0.0.0.0:8080` | Address for the plain HTTP listener |
+| `--asset-path` | `ASSET_PATH` | `/app/assets` | Directory served under `/assets/` |
+| `--cache-ttl-seconds` | `CACHE_TTL_SECONDS` | `300` | Longest time any cache entry is kept; 0 turns caching off |
+| `--cache-size-mb` | `CACHE_SIZE_MB` | `100` | Cache size in MiB for origin responses and assets together; 0 turns caching off |
+| `--tls-cert` | `TLS_CERT_PATH` | none | PEM certificate chain |
+| `--tls-key` | `TLS_KEY_PATH` | none | PEM private key in PKCS#8 form |
+| `--tls-listen-addr` | `TLS_LISTEN_ADDR` | `0.0.0.0:8443` | Address for the HTTPS listener, used only when both TLS paths are set |
+| `--upstream-timeout-seconds` | `UPSTREAM_TIMEOUT_SECONDS` | `30` | Seconds to wait for the origin's response headers before answering 504 |
+
+`cargo run -- --help` prints the same list.
+
+## TLS
+
+When both `--tls-cert` and `--tls-key` are set, shadowstep also listens for HTTPS on `--tls-listen-addr`. The HTTP listener on `--listen-addr` keeps running. If only one of the two paths is set, HTTPS is off.
+
+The key must be PKCS#8 (`-----BEGIN PRIVATE KEY-----`). Only the first key in the file is used. To convert a PKCS#1 or SEC1 key:
+
+```bash
+openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pkcs8.pem
+```
+
+A self-signed certificate for local testing (OpenSSL 3 writes PKCS#8 by default):
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=localhost \
+  -keyout certs/key.pem -out certs/cert.pem
+```
+
+`certs/` is listed in `.gitignore` and `.dockerignore`, so keys there are never committed or sent to a Docker build.
+
+## Docker
+
+The image contains the binary and the contents of `assets/`. It does not contain certificates.
 
 ```bash
 docker build -t shadowstep:local .
 ```
 
-```bash
-docker run -d \
-  --name shadowstep_cdn \
-  -e RUST_LOG=info \
-  -p 8080:8080 \
-  -p 8443:8443 \
-  -v $(pwd)/assets:/app/assets \
-  shadowstep:local \
-  --origin-url http://example.com \
-  --tls-cert /app/certs/cert.pem \
-  --tls-key /app/certs/key.pem
-```
-
-The options explained:
-- `-d`: Run container in detached mode (background)
-- `--name shadowstep_cdn`: Name the container for easy reference
-- `-e RUST_LOG=info`: Set logging level (use `debug` for more verbose output)
-- `-p 8080:8080 -p 8443:8443`: Map container ports to host ports
-- `-v $(pwd)/assets:/app/assets`: Mount local assets directory to container
-- `--origin-url`: Set the upstream origin server (use a real server or example.com for testing)
-- `--tls-cert` and `--tls-key`: Paths to TLS certificate and key files inside the container
-
-#### other operating systems (Windows, macOS)
-
-1.  **install rust**: follow instructions at [rustup.rs](https://rustup.rs/).
-2.  **build from source**:
-    ```bash
-    git clone git@github.com:jamiehdev/shadowstep.git
-    cd shadowstep
-    cargo build --release
-    ```
-3.  **run**:
-    *   **Windows (PowerShell)**:
-        ```powershell
-        $env:ORIGIN_URL="http://shadowstep.example.com"; $env:LISTEN_ADDR="0.0.0.0:8080"; .\target\release\shadowstep.exe
-        ```
-    *   **macOS/Linux (bash/zsh)**:
-        ```bash
-        ORIGIN_URL="http://shadowstep.example.com" LISTEN_ADDR="0.0.0.0:8080" ./target/release/shadowstep
-        ```
-
-#### kubernetes
-
-basic Kubernetes manifests are provided in the `k8s/` directory for local testing with tools like Minikube or Kind.
+HTTP only:
 
 ```bash
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
+docker run --rm -p 8080:8080 shadowstep:local --origin-url http://example.com
 ```
 
-## project structure
-
-```
-shadowstep/
-├── assets/          # non-code assets (images, configs)
-│   └── images/      # image assets
-├── src/             # source code
-├── k8s/             # Kubernetes configs
-├── Cargo.toml       # rust package config
-└── README.md        # project documentation
-```
-
-## configuration
-
-| CLI argument    | environment variable | default         | description                        |
-|-----------------|----------------------|-----------------|------------------------------------|
-| `--origin`      | `ORIGIN_URL`         | (required)      | upstream origin server URL         |
-| `--listen`      | `LISTEN_ADDR`        | `0.0.0.0:8080`  | address and port to listen on      |
-| `--cache-ttl`   | `CACHE_TTL_SECONDS`  | `300`           | cache time-to-live in seconds      |
-| `--cache-size`  | `CACHE_SIZE_MB`      | `100`           | max cache size in megabytes        |
-| `--tls-cert`    | `TLS_CERT_PATH`      | (none)          | path to TLS certificate (pem)      |
-| `--tls-key`     | `TLS_KEY_PATH`       | (none)          | path to TLS private key (pem)      |
-
-## testing
-
-below are the tests run to verify both HTTP and HTTPS endpoints:
-
-### HTTP test - first request (cache miss)
+With HTTPS, mount the certificate directory read-only and pass the paths inside the container:
 
 ```bash
-# HTTP test - first request (cache miss)
-curl -v http://localhost:8080/assets/test.txt
+docker run --rm \
+  -p 8080:8080 -p 8443:8443 \
+  -v "$(pwd)/certs:/etc/shadowstep/certs:ro" \
+  -e ORIGIN_URL=http://example.com \
+  -e TLS_CERT_PATH=/etc/shadowstep/certs/cert.pem \
+  -e TLS_KEY_PATH=/etc/shadowstep/certs/key.pem \
+  shadowstep:local
 ```
 
-![HTTP test showing cache miss](https://i.imgur.com/GPTlpOS.png)
+The image exposes 8080 and 8443. If you change `LISTEN_ADDR` or `TLS_LISTEN_ADDR`, publish the matching ports.
 
-in this first request, you can see the `x-shadowstep-cache: MISS` header in the response, indicating the content was fetched from the origin.
+The container runs as user `shadowstep` (uid 1000), so the mounted key file must be readable by that uid.
 
-### HTTP test - second request (cache hit)
+## Kubernetes
+
+`k8s/` holds a Deployment and a LoadBalancer Service. Before applying them, set the image and `ORIGIN_URL` in `k8s/deployment.yaml` and create the TLS Secret the Deployment mounts at `/etc/tls`:
 
 ```bash
-# HTTP test - second request (cache hit)
-curl -v http://localhost:8080/assets/test.txt
+kubectl create secret tls shadowstep-tls --cert=certs/cert.pem --key=certs/key.pem
+kubectl apply -f k8s/
 ```
 
-![HTTP test showing cache hit](https://i.imgur.com/cUmSQk5.png)
+The Service maps port 80 to 8080 and 443 to 8443. Readiness and liveness probes call `/health` on port 8080. To run without TLS, remove the `TLS_CERT_PATH`, `TLS_KEY_PATH` and `TLS_LISTEN_ADDR` variables, the `tls` volume and mount, and the `https` ports.
 
-the second request shows `x-shadowstep-cache: HIT` in the response headers, confirming the file is now being served from cache.
+`CACHE_SIZE_MB` is set to 100 against a 256Mi memory limit. Change the two together.
 
-### HTTPS test
+The Deployment runs two replicas, and each has its own cache. `X-Forwarded-For` holds whatever source address reaches the pod. With the Service's default `externalTrafficPolicy: Cluster`, that is often a node address rather than the client's.
+
+## Tests
 
 ```bash
-# HTTPS test (insecure for self-signed cert)
-curl -kv https://localhost:8443/assets/test.txt
+cargo test
 ```
 
-for HTTPS tests, the output is similar but shows HTTP/2 protocol being used:
+Unit tests in `src/assets.rs` cover asset path traversal, `src/cache.rs` covers `Cache-Control` parsing, and `src/forwarded.rs` covers reading the client's address, scheme and host from the connection. The integration tests in `tests/integration/` build one test crate and run the app against a [wiremock](https://crates.io/crates/wiremock) origin or a local TCP origin:
 
-```
-* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
-* ALPN: server accepted h2
-* Connected to localhost (::1) port 8443
-* using HTTP/2
-< HTTP/2 200
-< content-length: 12
-< cache-control: public, max-age=86400
-< etag: "9cfedc1214908e0b6a357b17e96244b0"
-< x-shadowstep-cache: HIT
-< content-type: text/plain
-< date: Sat, 10 May 2025 18:53:37 GMT
-<
-hello HTTPS
-```
+- `smoke.rs`: `/health`, proxying, upstream paths and the 502 path
+- `proxy.rs`: request and response bodies, the upstream timeout, hop-by-hop and URL override headers
+- `tls.rs`: the HTTPS listener and `--tls-listen-addr`
+- `forwarded.rs`: removal and replacement of forwarding headers
+- `cache.rs`: origin response caching
 
-### proxy test
+CI also runs:
 
 ```bash
-curl -i http://localhost:8080/proxy_test.txt
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-expected response:
+## Licence
 
-```text
-HTTP/1.1 200 OK
-Upstream proxy test content
-```
-
-    example `shadowstep` server logs for this proxied request:
-    ```log
-    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Incoming proxy request: GET /proxy_test.txt from 127.0.0.1
-    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Forwarding request to: http://localhost:3000//proxy_test.txt
-    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Received response from upstream: 200
-    [2025-05-10T23:24:05Z INFO  actix_web::middleware::logger] GET /proxy_test.txt HTTP/1.1 200 28 3.550893 ms
-    ```
-
-#### end-to-end reverse proxy test with python origin
-
-1.  **create a test file in a new `upstream_test` directory:**
-    ```bash
-    mkdir upstream_test
-    echo "hello from upstream" > upstream_test/example.html
-    ```
-
-2.  **start a python http server in that directory on port 3000:**
-    ```bash
-    python3 -m http.server 3000 --directory upstream_test
-    ```
-
-3.  **in another terminal, run shadowstep, configured to proxy to `http://localhost:3000`:**
-    ```bash
-    export ORIGIN_URL=http://localhost:3000
-    ./target/release/shadowstep --listen-addr 0.0.0.0:8081 
-    # (or however you prefer to run it, ensuring ORIGIN_URL points to localhost:3000)
-    ```
-
-4.  **test the proxy:**
-    ```bash
-    curl -i http://localhost:8081/example.html
-    ```
-    expected output:
-    ```text
-    HTTP/1.1 200 OK
-    Content-Type: text/html; charset=utf-8
-    Content-Length: 20 # or similar
-    Server: SimpleHTTP/0.6 Python/3.x.x # or similar
-    Date: ...
-    
-    hello from upstream
-    ```
-
-    example `shadowstep` server logs for this proxied request:
-    ```log
-    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Incoming proxy request: GET /example.html from 127.0.0.1
-    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Forwarding request to: http://localhost:3000/example.html
-    [2025-05-10T23:24:05Z DEBUG shadowstep::proxy] Received response from upstream: 200
-    [2025-05-10T23:24:05Z INFO  actix_web::middleware::logger] GET /example.html HTTP/1.1 200 20 3.550893 ms 
-    ```
-
-### health endpoint test
-
-```bash
-# check cache statistics
-curl http://localhost:8080/health
-```
-
-```
-{"cache":{"hit_ratio":0.75,"hits":3,"items":1,"misses":1},"status":"ok"}
-```
-
-the health endpoint displays cache statistics, showing the ratio of hits to total requests, confirming the cache is working as expected.
-
-## license
-
-[MIT](https://opensource.org/licenses/MIT).
+[MIT](LICENSE)

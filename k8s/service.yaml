@@ -12,6 +12,6 @@ spec:
   - name: http
     port: 80
     targetPort: http
-  # - name: https # optional: if tls is enabled
-  #   port: 443
-  #   targetPort: https 
+  - name: https
+    port: 443
+    targetPort: https

@@ -1,68 +1,37 @@
-# Stage 1: Build
-# Use the official Rust image as a builder
-FROM rust:1.82-bullseye AS builder
+# rust 1.85 is the minimum: the dev-dependencies wiremock and hyper-util use
+# edition 2024, and cargo parses every manifest in Cargo.lock
+FROM rust:1.90-bookworm AS builder
 
-# Set the working directory
 WORKDIR /usr/src/shadowstep
 
-# Clean cargo caches to ensure a completely fresh state
-RUN rm -rf /usr/local/cargo/registry /usr/local/cargo/git ~/.cargo/registry ~/.cargo/git
-
-# Install build dependencies (if any beyond Rust toolchain, e.g., for linking)
-# RUN apt-get update && apt-get install -y some-lib-dev && rm -rf /var/lib/apt/lists/*
-
-# Copy Cargo.toml and Cargo.lock
 COPY Cargo.toml Cargo.lock ./
-
-# Copy the source code
 COPY src ./src
 
-# Build the application (this will also build dependencies)
-# We remove --locked here initially to ensure Cargo.lock can be regenerated if needed.
-# If this succeeds, for subsequent production builds, --locked should be used.
-RUN cargo update && cargo build --release
+RUN cargo build --release --locked
 
-# Stage 2: Runtime
-# Use a slim base image
-FROM debian:bullseye-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies (e.g., CA certificates)
 RUN apt-get update && \
-    apt-get install -y ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user and group
-RUN groupadd -r shadowstep && \
-    useradd -r -g shadowstep -s /bin/false -d /app shadowstep
+# uid and gid 1000 match runAsUser and fsGroup in k8s/deployment.yaml
+RUN groupadd -r -g 1000 shadowstep && \
+    useradd -r -u 1000 -g shadowstep -s /bin/false -d /app shadowstep
 
-# Create directories and set permissions
-RUN mkdir -p /app/assets && \
-    chown -R shadowstep:shadowstep /app
-
-COPY ./certs /app/certs
-RUN chown -R shadowstep:shadowstep /app/certs
-
-# Copy static assets for serving
-COPY ./assets /app/assets
-RUN chown -R shadowstep:shadowstep /app/assets
+# certificates are not copied into the image: mount them at run time and pass
+# --tls-cert and --tls-key (or TLS_CERT_PATH and TLS_KEY_PATH)
+COPY --chown=shadowstep:shadowstep ./assets /app/assets
 
 WORKDIR /app
 
-# Copy the compiled binary from the builder stage
 COPY --from=builder /usr/src/shadowstep/target/release/shadowstep /usr/local/bin/shadowstep
-RUN chmod +x /usr/local/bin/shadowstep && \
-    chown shadowstep:shadowstep /usr/local/bin/shadowstep
 
-# Expose the default ports (update if your defaults change)
 EXPOSE 8080
-# For TLS connections
+# the HTTPS listener binds TLS_LISTEN_ADDR (default 0.0.0.0:8443) when both
+# TLS paths are set
 EXPOSE 8443
 
-# Switch to non-root user
 USER shadowstep
 
-# Set the entrypoint
 ENTRYPOINT ["/usr/local/bin/shadowstep"]
-
-# Default command (can be overridden)
-# CMD ["--origin", "http://default-origin.example.com"] 
