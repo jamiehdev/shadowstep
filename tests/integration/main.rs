@@ -4,5 +4,6 @@ mod common;
 mod forwarded;
 mod http2;
 mod proxy;
+mod revalidation;
 mod smoke;
 mod tls;

@@ -6,9 +6,10 @@ use actix_web::http::{Method, StatusCode};
 use bytes::Bytes;
 use moka::sync::Cache;
 use moka::Expiry;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 const MIB: u64 = 1024 * 1024;
@@ -91,7 +92,11 @@ pub struct StoredResponse {
     pub body: Bytes,
     stored_at: Instant,
     initial_age: Duration,
+    /// the freshness lifetime left when the response was stored
     ttl: Duration,
+    /// how long the store keeps the response once it is stale
+    grace: Duration,
+    stale: StaleRules,
 }
 
 impl StoredResponse {
@@ -103,6 +108,132 @@ impl StoredResponse {
     fn is_fresh(&self) -> bool {
         self.stored_at.elapsed() < self.ttl
     }
+
+    /// how long the response has been stale, or `None` while it is fresh.
+    fn staleness(&self) -> Option<Duration> {
+        self.stored_at.elapsed().checked_sub(self.ttl)
+    }
+
+    fn stale_within(&self, window: Duration) -> bool {
+        !self.stale.must_revalidate && self.staleness().is_some_and(|s| s < window)
+    }
+
+    /// whether the response may be served stale while a background request
+    /// revalidates it (RFC 5861 section 3).
+    pub fn may_serve_while_revalidating(&self) -> bool {
+        self.stale_within(self.stale.while_revalidate)
+    }
+
+    /// whether the response may be served stale in place of an origin error
+    /// (RFC 5861 section 4).
+    pub fn may_serve_on_error(&self) -> bool {
+        self.stale_within(self.stale.if_error)
+    }
+
+    /// whether a stale use of the response needs a successful revalidation
+    /// (RFC 9111 sections 5.2.2.2, 5.2.2.8 and 5.2.2.10).
+    pub fn must_revalidate(&self) -> bool {
+        self.stale.must_revalidate
+    }
+
+    /// the conditional request fields built from the stored validators (RFC
+    /// 9111 section 4.3.1).
+    pub fn validators(&self) -> Fields {
+        let mut fields = Fields::new();
+        for (name, value) in &self.headers {
+            if name == header::ETAG {
+                fields.push((header::IF_NONE_MATCH, value.clone()));
+            } else if name == header::LAST_MODIFIED {
+                fields.push((header::IF_MODIFIED_SINCE, value.clone()));
+            }
+        }
+        fields
+    }
+}
+
+/// what a response's Cache-Control allows once it is stale.
+#[derive(Clone, Copy, Default)]
+struct StaleRules {
+    while_revalidate: Duration,
+    if_error: Duration,
+    must_revalidate: bool,
+}
+
+impl StaleRules {
+    fn parse(directives: &Directives) -> Self {
+        StaleRules {
+            while_revalidate: directives
+                .seconds("stale-while-revalidate")
+                .unwrap_or_default(),
+            if_error: directives.seconds("stale-if-error").unwrap_or_default(),
+            // s-maxage carries the semantics of proxy-revalidate for a shared
+            // cache (RFC 9111 section 5.2.2.10)
+            must_revalidate: ["must-revalidate", "proxy-revalidate", "s-maxage"]
+                .iter()
+                .any(|d| directives.has(d)),
+        }
+    }
+
+    /// how long a stale response stays in the store: long enough for its
+    /// stale windows, and up to `cap` when it has a validator, so that it can
+    /// be revalidated instead of fetched again in full. never more than `cap`.
+    fn grace(&self, has_validator: bool, cap: Duration) -> Duration {
+        let windows = if self.must_revalidate {
+            Duration::ZERO
+        } else {
+            self.while_revalidate.max(self.if_error)
+        };
+        let revalidation = if has_validator { cap } else { Duration::ZERO };
+        windows.max(revalidation).min(cap)
+    }
+}
+
+/// a stored response for a request, and whether it may answer it as is.
+pub enum Lookup {
+    /// fresh, and no older than the request allows
+    Fresh(Arc<StoredResponse>),
+    /// stale, or older than the request's max-age, so it needs revalidation
+    /// before it is used, unless a stale window applies
+    Stale(StaleEntry),
+}
+
+/// a stored response that needs revalidation, and where it is stored.
+pub struct StaleEntry {
+    pub response: Arc<StoredResponse>,
+    key: ResponseKey,
+}
+
+/// the fields of a stored response updated from a 304 (RFC 9111 section
+/// 3.2): each field in `update` replaces the stored values of that name.
+/// `update` must already leave out the fields that are not stored.
+pub fn updated_fields(stored: &Fields, update: &Fields) -> Fields {
+    let mut fields: Fields = stored
+        .iter()
+        .filter(|(name, _)| !update.iter().any(|(n, _)| n == name))
+        .cloned()
+        .collect();
+    fields.extend(update.iter().cloned());
+    fields
+}
+
+/// the only background revalidation of a stored response. dropping it lets
+/// the next stale request start another.
+pub struct RefreshGuard {
+    refreshing: Arc<Mutex<HashSet<ResponseKey>>>,
+    key: ResponseKey,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        lock(&self.refreshing).remove(&self.key);
+    }
+}
+
+/// the set of keys being refreshed. a panic while the lock is held cannot
+/// leave the set inconsistent, so a poisoned lock is still usable.
+fn lock(set: &Mutex<HashSet<ResponseKey>>) -> std::sync::MutexGuard<'_, HashSet<ResponseKey>> {
+    set.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn entry_weight(key: &Key, entry: &Entry) -> u32 {
@@ -152,7 +283,7 @@ impl Expiry<Key, Entry> for EntryExpiry {
 fn entry_ttl(entry: &Entry) -> Duration {
     match entry {
         Entry::Asset(asset) => asset.ttl,
-        Entry::Response(response) => response.ttl,
+        Entry::Response(response) => response.ttl.saturating_add(response.grace),
     }
 }
 
@@ -162,6 +293,7 @@ pub struct Store {
     entries: Cache<Key, Entry>,
     index: Cache<PrimaryKey, Arc<Index>>,
     generation: Arc<AtomicU64>,
+    refreshing: Arc<Mutex<HashSet<ResponseKey>>>,
     ttl: Duration,
     max_entry: u64,
 }
@@ -176,11 +308,13 @@ impl Store {
                 .weigher(entry_weight)
                 .expire_after(EntryExpiry)
                 .build(),
+            // an entry lives for at most its ttl plus a grace of up to ttl
             index: Cache::builder()
                 .max_capacity(MAX_INDEXED_URIS)
-                .time_to_live(ttl.max(Duration::from_secs(1)))
+                .time_to_live(ttl.saturating_mul(2).max(Duration::from_secs(1)))
                 .build(),
             generation: Arc::new(AtomicU64::new(0)),
+            refreshing: Arc::default(),
             ttl,
             max_entry: capacity.min(MAX_ENTRY_BYTES),
         }
@@ -234,34 +368,118 @@ impl Store {
         asset
     }
 
-    /// a fresh stored response for `primary` that matches the request's
-    /// `Vary` fields (RFC 9111 section 4.1) and is no older than `max_age`.
+    /// the stored response for `primary` that matches the request's `Vary`
+    /// fields (RFC 9111 section 4.1). it is fresh when its freshness lifetime
+    /// has not run out and it is no older than `max_age`.
     pub fn lookup(
         &self,
         primary: &PrimaryKey,
         request: &HeaderMap,
         max_age: Option<Duration>,
-    ) -> Option<Arc<StoredResponse>> {
+    ) -> Option<Lookup> {
         let index = self.index.get(primary)?;
-        let key = Key::Response(ResponseKey {
+        let key = ResponseKey {
             primary: primary.clone(),
             generation: index.generation,
             vary: vary_values(&index.vary, request),
-        });
-        let Entry::Response(response) = self.entries.get(&key)? else {
+        };
+        let Entry::Response(response) = self.entries.get(&Key::Response(key.clone()))? else {
             return None;
         };
-        if !response.is_fresh() {
-            return None;
+        if response.is_fresh() && max_age.is_none_or(|max_age| response.age() <= max_age) {
+            return Some(Lookup::Fresh(response));
         }
-        if max_age.is_some_and(|max_age| response.age() > max_age) {
-            return None;
+        Some(Lookup::Stale(StaleEntry { response, key }))
+    }
+
+    /// claims the background revalidation of `entry`, or `None` when one is
+    /// already running.
+    pub fn start_refresh(&self, entry: &StaleEntry) -> Option<RefreshGuard> {
+        lock(&self.refreshing)
+            .insert(entry.key.clone())
+            .then(|| RefreshGuard {
+                refreshing: self.refreshing.clone(),
+                key: entry.key.clone(),
+            })
+    }
+
+    /// `entry` updated from a 304 (RFC 9111 section 4.3.4). `update` holds
+    /// the 304's fields that are stored, and `age` its `Age`. the updated
+    /// response replaces the entry when it may still be stored, and the
+    /// entry is removed when it may not. an entry that another response has
+    /// replaced since the lookup is left alone.
+    pub fn freshen(
+        &self,
+        entry: &StaleEntry,
+        request_policy: &RequestPolicy,
+        request: &HeaderMap,
+        update: &Fields,
+        age: Option<&HeaderValue>,
+    ) -> Arc<StoredResponse> {
+        let stored = &entry.response;
+        let headers = updated_fields(&stored.headers, update);
+        let mut map = HeaderMap::with_capacity(headers.len() + 1);
+        for (name, value) in &headers {
+            map.append(name.clone(), value.clone());
         }
-        Some(response)
+        if let Some(age) = age {
+            map.insert(header::AGE, age.clone());
+        }
+        let storable = storable(request_policy, request, stored.status, &map);
+        let key = Key::Response(entry.key.clone());
+        let current =
+            matches!(self.entries.get(&key), Some(Entry::Response(r)) if Arc::ptr_eq(&r, stored));
+        let policy = match storable {
+            Some((policy, vary)) if current => {
+                let body = stored.body.clone();
+                let primary = entry.key.primary.clone();
+                if let Some(fresh) = self.insert_response(
+                    primary,
+                    vary,
+                    &policy,
+                    stored.status,
+                    headers.clone(),
+                    body,
+                ) {
+                    return fresh;
+                }
+                policy
+            }
+            Some((policy, _)) => policy,
+            None => {
+                if current {
+                    self.entries.invalidate(&key);
+                }
+                Storable::default()
+            }
+        };
+        Arc::new(self.response(&policy, stored.status, headers, stored.body.clone()))
+    }
+
+    fn response(
+        &self,
+        policy: &Storable,
+        status: StatusCode,
+        headers: Fields,
+        body: Bytes,
+    ) -> StoredResponse {
+        let mut response = StoredResponse {
+            status,
+            headers,
+            body,
+            stored_at: Instant::now(),
+            initial_age: policy.initial_age,
+            ttl: policy.ttl.min(self.ttl),
+            grace: Duration::ZERO,
+            stale: policy.stale,
+        };
+        let has_validator = !response.validators().is_empty();
+        response.grace = policy.stale.grace(has_validator, self.ttl);
+        response
     }
 
     /// stores `body` under `primary` and the request's values for the
-    /// response's `Vary` field names.
+    /// response's `Vary` field names, and returns the stored response.
     pub fn insert_response(
         &self,
         primary: PrimaryKey,
@@ -270,9 +488,9 @@ impl Store {
         status: StatusCode,
         headers: Fields,
         body: Bytes,
-    ) {
+    ) -> Option<Arc<StoredResponse>> {
         if !self.enabled() || body.len() as u64 > self.max_entry {
-            return;
+            return None;
         }
         // a response whose Vary names differ from the stored one's replaces
         // every stored variant
@@ -292,17 +510,10 @@ impl Store {
             generation,
             vary: vary.values,
         });
-        let response = StoredResponse {
-            status,
-            headers,
-            body,
-            stored_at: Instant::now(),
-            initial_age: policy.initial_age,
-            ttl: policy.ttl.min(self.ttl),
-        };
-        self.entries
-            .insert(key, Entry::Response(Arc::new(response)));
+        let response = Arc::new(self.response(policy, status, headers, body));
+        self.entries.insert(key, Entry::Response(response.clone()));
         self.entries.run_pending_tasks();
+        Some(response)
     }
 
     /// makes every stored response for `primary` unreachable (RFC 9111
@@ -426,7 +637,19 @@ pub struct RequestPolicy {
     /// whether the origin's response may be stored
     may_store: bool,
     has_credentials: bool,
+    /// whether the request has its own preconditions (RFC 9110 section 13.1)
+    pub conditional: bool,
 }
+
+/// the request fields that make a request conditional (RFC 9110 section
+/// 13.1).
+pub const PRECONDITION_HEADERS: [HeaderName; 5] = [
+    header::IF_MATCH,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_UNMODIFIED_SINCE,
+    header::IF_RANGE,
+];
 
 impl RequestPolicy {
     pub fn new(method: &Method, headers: &HeaderMap) -> Self {
@@ -445,14 +668,24 @@ impl RequestPolicy {
             max_age: directives.seconds("max-age"),
             may_store: cacheable_method && *method == Method::GET && !no_store,
             has_credentials: headers.contains_key(AUTHORIZATION) || headers.contains_key(COOKIE),
+            conditional: PRECONDITION_HEADERS.iter().any(|h| headers.contains_key(h)),
         }
+    }
+
+    /// whether a stale response may answer the request. a request max-age
+    /// asks for a response no older than that, so it rules out stale ones
+    /// (RFC 9111 section 5.2.1.1).
+    pub fn may_serve_stale(&self) -> bool {
+        self.max_age.is_none()
     }
 }
 
 /// a response that the store may keep, and for how long.
+#[derive(Default)]
 pub struct Storable {
     ttl: Duration,
     initial_age: Duration,
+    stale: StaleRules,
 }
 
 /// status codes that are cacheable by default (RFC 9110 section 15.1).
@@ -462,7 +695,7 @@ const CACHEABLE_BY_DEFAULT: [u16; 11] = [200, 203, 204, 300, 301, 308, 404, 405,
 /// Cache-Control directives that stop a shared cache storing a response. a
 /// shared cache must not store private responses, qualified or not (RFC 9111
 /// section 5.2.2.7). no-cache would need revalidation on every use (section
-/// 5.2.2.4), and this cache does not revalidate.
+/// 5.2.2.4), and this cache revalidates only stale responses.
 const UNSTORABLE_DIRECTIVES: [&str; 3] = ["no-store", "private", "no-cache"];
 
 /// whether a shared cache may store the origin's response to a request
@@ -499,7 +732,12 @@ pub fn storable(
     }
 
     let values = vary_values(&names, request);
-    Some((Storable { ttl, initial_age }, Vary { names, values }))
+    let storable = Storable {
+        ttl,
+        initial_age,
+        stale: StaleRules::parse(&directives),
+    };
+    Some((storable, Vary { names, values }))
 }
 
 /// the response's Cache-Control directives, or `None` when the response
@@ -618,6 +856,34 @@ mod tests {
     fn quoted_argument_is_unquoted() {
         let d = directives("max-age=\"7\"");
         assert_eq!(d.seconds("max-age"), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn not_modified_fields_replace_stored_fields_of_the_same_name() {
+        let field = |name: &'static str, value: &'static str| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        };
+        let stored = vec![
+            field("x-version", "1"),
+            field("cache-control", "max-age=1"),
+            field("x-version", "1b"),
+            field("etag", "\"v1\""),
+        ];
+        let update = vec![field("cache-control", "max-age=60"), field("x-new", "yes")];
+
+        assert_eq!(
+            updated_fields(&stored, &update),
+            vec![
+                field("x-version", "1"),
+                field("x-version", "1b"),
+                field("etag", "\"v1\""),
+                field("cache-control", "max-age=60"),
+                field("x-new", "yes"),
+            ]
+        );
     }
 
     #[test]

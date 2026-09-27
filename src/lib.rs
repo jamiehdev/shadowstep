@@ -35,11 +35,16 @@ use url::Url;
 use crate::cache::Store;
 use crate::config::Config;
 
-/// hits and misses across origin responses and local assets
+/// how the cache answered requests. each proxied or asset response counts
+/// once, as a hit, a miss, a revalidation or a stale serve. background
+/// refreshes count the background revalidations started.
 #[derive(Default)]
 pub struct CacheStats {
     hits: AtomicU64,
     misses: AtomicU64,
+    revalidations: AtomicU64,
+    stale: AtomicU64,
+    background_refreshes: AtomicU64,
 }
 
 impl CacheStats {
@@ -49,6 +54,20 @@ impl CacheStats {
 
     fn miss(&self) {
         self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// a 304 that freshened a stored response, in the foreground or the
+    /// background
+    fn revalidation(&self) {
+        self.revalidations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stale(&self) {
+        self.stale.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn background_refresh(&self) {
+        self.background_refreshes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -64,17 +83,26 @@ pub struct AppState {
 
 #[get("/health")]
 async fn health_check(state: web::Data<AppState>) -> impl Responder {
-    let hits = state.cache_stats.hits.load(Ordering::Relaxed);
-    let misses = state.cache_stats.misses.load(Ordering::Relaxed);
+    let stats = &state.cache_stats;
+    let hits = stats.hits.load(Ordering::Relaxed);
+    let misses = stats.misses.load(Ordering::Relaxed);
+    let revalidations = stats.revalidations.load(Ordering::Relaxed);
+    let stale = stats.stale.load(Ordering::Relaxed);
+    // the share of responses whose body came from the cache
+    let from_cache = hits + revalidations + stale;
+    let total = from_cache + misses;
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "cache": {
             "hits": hits,
             "misses": misses,
+            "revalidations": revalidations,
+            "stale": stale,
+            "background_refreshes": stats.background_refreshes.load(Ordering::Relaxed),
             "items": state.cache.entry_count(),
             "bytes": state.cache.weighted_size(),
-            "hit_ratio": if hits + misses > 0 {
-                hits as f64 / (hits + misses) as f64
+            "hit_ratio": if total > 0 {
+                from_cache as f64 / total as f64
             } else {
                 0.0
             }
