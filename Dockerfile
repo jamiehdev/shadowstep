@@ -32,6 +32,6 @@ EXPOSE 8080
 # TLS paths are set
 EXPOSE 8443
 
-USER shadowstep
+USER 1000:1000
 
 ENTRYPOINT ["/usr/local/bin/shadowstep"]
