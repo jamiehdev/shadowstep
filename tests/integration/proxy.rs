@@ -79,6 +79,41 @@ async fn put_body_reaches_origin() {
 }
 
 #[actix_web::test]
+async fn get_without_a_body_reaches_origin_without_body_fields() {
+    let origin = origin_accepting("GET", "/page").await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let resp = test::call_service(&app, test::TestRequest::get().uri("/page").to_request()).await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = only_request(&origin).await;
+    assert!(received.headers.get("transfer-encoding").is_none());
+    assert!(received.headers.get("content-length").is_none());
+    assert!(received.body.is_empty());
+}
+
+// hyper sends a GET, HEAD or CONNECT body of unknown length as no body at
+// all, so only another method shows whether an empty payload became a
+// streaming body, which hyper would send chunked
+#[actix_web::test]
+async fn delete_without_a_body_reaches_origin_without_body_fields() {
+    let origin = origin_accepting("DELETE", "/items/1").await;
+    let (app, _assets) = common::service(&origin.uri()).await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::delete().uri("/items/1").to_request(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = only_request(&origin).await;
+    assert!(received.headers.get("transfer-encoding").is_none());
+    assert!(received.headers.get("content-length").is_none());
+    assert!(received.body.is_empty());
+}
+
+#[actix_web::test]
 async fn large_post_body_reaches_origin_with_its_length() {
     let origin = origin_accepting("POST", "/upload").await;
     let server = common::spawn(&origin.uri());
