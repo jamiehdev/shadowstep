@@ -1,6 +1,6 @@
 use rustls::crypto::ring;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::pem::{self, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::fs::File;
 use std::io::{self, BufReader};
@@ -28,19 +28,19 @@ pub fn bind_listeners(
     Ok((http, tls))
 }
 
-/// loads a rustls server config from a PEM certificate chain and a PKCS#8
-/// private key. only the first key in the key file is used.
+/// loads a rustls server config from a PEM certificate chain and a PEM
+/// private key in PKCS#8, PKCS#1 (RSA) or SEC1 (EC) form. only the first key
+/// in the key file is used.
 pub fn load_rustls_config(cert_path: &Path, key_path: &Path) -> io::Result<ServerConfig> {
     let cert_chain = CertificateDer::pem_reader_iter(BufReader::new(File::open(cert_path)?))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| invalid_input("invalid cert"))?;
 
-    let key =
-        match PrivatePkcs8KeyDer::pem_reader_iter(BufReader::new(File::open(key_path)?)).next() {
-            Some(Ok(key)) => PrivateKeyDer::from(key),
-            Some(Err(_)) => return Err(invalid_input("invalid key")),
-            None => return Err(invalid_input("No private keys found")),
-        };
+    let key = match PrivateKeyDer::from_pem_reader(BufReader::new(File::open(key_path)?)) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => return Err(invalid_input("No private keys found")),
+        Err(_) => return Err(invalid_input("invalid key")),
+    };
 
     // an explicit provider, because rustls panics in `ServerConfig::builder`
     // when the build enables more than one crypto provider feature
@@ -54,4 +54,42 @@ pub fn load_rustls_config(cert_path: &Path, key_path: &Path) -> io::Result<Serve
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// a test-only PEM file under `tests/fixtures/tls`, made with openssl.
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tls")
+            .join(name)
+    }
+
+    #[test]
+    fn loads_pkcs1_rsa_key() {
+        load_rustls_config(&fixture("rsa-cert.pem"), &fixture("rsa-pkcs1-key.pem")).unwrap();
+    }
+
+    #[test]
+    fn loads_sec1_ec_key() {
+        load_rustls_config(&fixture("ec-cert.pem"), &fixture("ec-sec1-key.pem")).unwrap();
+    }
+
+    #[test]
+    fn uses_only_the_first_key_in_the_key_file() {
+        let read = |name| std::fs::read_to_string(fixture(name)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ec_first = dir.path().join("ec-first.pem");
+        let rsa_first = dir.path().join("rsa-first.pem");
+        let (ec, rsa) = (read("ec-sec1-key.pem"), read("rsa-pkcs1-key.pem"));
+        std::fs::write(&ec_first, format!("{ec}{rsa}")).unwrap();
+        std::fs::write(&rsa_first, format!("{rsa}{ec}")).unwrap();
+
+        load_rustls_config(&fixture("ec-cert.pem"), &ec_first).unwrap();
+        // rustls rejects a key that does not match the certificate
+        assert!(load_rustls_config(&fixture("ec-cert.pem"), &rsa_first).is_err());
+    }
 }

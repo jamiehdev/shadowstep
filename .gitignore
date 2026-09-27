@@ -7,3 +7,5 @@ assets/*
 certs/
 *.pem
 *.key
+# test-only keys and certificates for the tls unit tests
+!tests/fixtures/tls/*.pem
