@@ -151,6 +151,7 @@ mod tests {
             cache_size_mb: 100,
             tls_cert_path: None,
             tls_key_path: None,
+            tls_listen_addr: "127.0.0.1:0".into(),
             upstream_timeout_seconds: 30,
         })
         .unwrap()
