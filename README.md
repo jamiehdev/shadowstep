@@ -127,13 +127,13 @@ Known limits:
 Each release tag `vX.Y.Z` publishes a multi-platform image for `linux/amd64` and `linux/arm64` to `ghcr.io/jamiehdev/shadowstep`, tagged `X.Y.Z`, `X.Y` and `latest`. A pre-release tag such as `v2.1.0-rc.1` publishes only `2.1.0-rc.1`.
 
 ```bash
-docker pull ghcr.io/jamiehdev/shadowstep:2.0.0
+docker pull ghcr.io/jamiehdev/shadowstep:2.1.0
 ```
 
 The image carries SLSA provenance and an SBOM. To check that an image was built by this repository's release workflow:
 
 ```bash
-gh attestation verify oci://ghcr.io/jamiehdev/shadowstep:2.0.0 --owner jamiehdev
+gh attestation verify oci://ghcr.io/jamiehdev/shadowstep:2.1.0 --owner jamiehdev
 ```
 
 Releases do not include prebuilt binaries. To run outside a container, build from source as shown in [Build](#build).
@@ -239,7 +239,7 @@ The container runs as user `shadowstep` (uid 1000), so the mounted key file must
 
 ## Kubernetes
 
-`k8s/` holds a Deployment and a LoadBalancer Service. The Deployment runs `ghcr.io/jamiehdev/shadowstep:2.0.0`. Before applying them, set `ORIGIN_URL` in `k8s/deployment.yaml` and create the TLS Secret the Deployment mounts at `/etc/tls`:
+`k8s/` holds a Deployment and a LoadBalancer Service. The Deployment runs `ghcr.io/jamiehdev/shadowstep:2.1.0`. Before applying them, set `ORIGIN_URL` in `k8s/deployment.yaml` and create the TLS Secret the Deployment mounts at `/etc/tls`:
 
 ```bash
 kubectl create secret tls shadowstep-tls --cert=certs/cert.pem --key=certs/key.pem
