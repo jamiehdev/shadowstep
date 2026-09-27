@@ -40,4 +40,4 @@ impl Config {
     pub fn is_tls_enabled(&self) -> bool {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
-} 
+}
