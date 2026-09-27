@@ -21,7 +21,7 @@ spec:
         fsGroup: 1000
       containers:
       - name: shadowstep
-        image: your-repo/shadowstep:latest # replace with your image registry/name
+        image: ghcr.io/jamiehdev/shadowstep:2.0.0
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
